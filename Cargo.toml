@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/tiders-core", "crates/tiders"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/luxus/tiders"
+authors = ["Tiders authors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+tiders-core = { path = "crates/tiders-core" }
+
+# TIDAL API client (up-to-date fork on Codeberg)
+tidlers = { git = "https://codeberg.org/tomkoid/tidlers.git" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 4
