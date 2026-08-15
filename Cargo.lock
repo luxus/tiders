@@ -2907,6 +2907,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "libc",
+ "objc",
  "rand 0.8.7",
  "reqwest",
  "rustfft",
