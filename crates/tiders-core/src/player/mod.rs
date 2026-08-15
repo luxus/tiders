@@ -17,8 +17,9 @@ pub use mpv::MpvBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::model::TrackView;
-use crate::queue::Queue;
+use crate::model::{StreamQuality, TrackView};
+use crate::playcount::PlayCountStore;
+use crate::queue::{Queue, RepeatMode, ShuffleMode};
 
 /// High-level playback state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,12 +46,16 @@ pub enum BackendKind {
 impl BackendKind {
     /// Build the concrete backend for this kind at the given start volume.
     pub fn build(self, volume: u8) -> Result<Box<dyn AudioBackend>> {
+        self.build_with(volume, "album")
+    }
+
+    pub fn build_with(self, volume: u8, replaygain: &str) -> Result<Box<dyn AudioBackend>> {
         match self {
             BackendKind::Null => Ok(Box::new(NullBackend::new())),
-            BackendKind::Mpv => Ok(Box::new(MpvBackend::new(volume)?)),
+            BackendKind::Mpv => Ok(Box::new(MpvBackend::with_replaygain(volume, replaygain)?)),
             BackendKind::Auto => {
                 if MpvBackend::is_available() {
-                    Ok(Box::new(MpvBackend::new(volume)?))
+                    Ok(Box::new(MpvBackend::with_replaygain(volume, replaygain)?))
                 } else {
                     Ok(Box::new(NullBackend::new()))
                 }
@@ -70,6 +75,9 @@ pub struct PlayerState {
     pub queue_position: Option<usize>,
     pub has_next: bool,
     pub has_previous: bool,
+    pub shuffle: ShuffleMode,
+    pub repeat: RepeatMode,
+    pub quality: StreamQuality,
 }
 
 /// The playback engine.
@@ -79,6 +87,10 @@ pub struct Player {
     status: PlayerStatus,
     volume: u8,
     now_playing: Option<TrackView>,
+    quality: StreamQuality,
+    /// Seconds of the current track already counted toward a play.
+    listened: f64,
+    scrobbled: bool,
 }
 
 impl Player {
@@ -90,12 +102,23 @@ impl Player {
             status: PlayerStatus::Stopped,
             volume: volume.min(100),
             now_playing: None,
+            quality: StreamQuality::default(),
+            listened: 0.0,
+            scrobbled: false,
         }
     }
 
     /// Create a player, building the backend from a [`BackendKind`].
     pub fn with_backend(kind: BackendKind, volume: u8) -> Result<Self> {
         Ok(Self::new(kind.build(volume)?, volume))
+    }
+
+    pub fn with_backend_replaygain(
+        kind: BackendKind,
+        volume: u8,
+        replaygain: &str,
+    ) -> Result<Self> {
+        Ok(Self::new(kind.build_with(volume, replaygain)?, volume))
     }
 
     /// Name of the active backend (`"mpv"` / `"null"`).
@@ -108,55 +131,120 @@ impl Player {
         &self.queue
     }
 
-    /// The current playback status.
+    /// Mutable access to the queue (for persist / shuffle rebuilds).
+    pub fn queue_mut(&mut self) -> &mut Queue {
+        &mut self.queue
+    }
+
     pub fn status(&self) -> PlayerStatus {
         self.status
     }
 
-    /// The current volume (0–100).
     pub fn volume(&self) -> u8 {
         self.volume
     }
 
-    /// The track currently loaded into the backend, if any.
     pub fn now_playing(&self) -> Option<&TrackView> {
         self.now_playing.as_ref()
     }
 
-    /// Replace the queue with `items`, positioned at `start`.
+    pub fn quality(&self) -> &StreamQuality {
+        &self.quality
+    }
+
+    pub fn shuffle(&self) -> ShuffleMode {
+        self.queue.shuffle()
+    }
+
+    pub fn repeat(&self) -> RepeatMode {
+        self.queue.repeat()
+    }
+
     pub fn set_queue(&mut self, items: Vec<TrackView>, start: usize) {
         self.queue.replace(items, start);
     }
 
-    /// Append a track to the queue.
     pub fn enqueue(&mut self, item: TrackView) {
         self.queue.push(item);
     }
 
-    /// Move the queue cursor to `index` without starting playback; returns the
-    /// track the caller should now resolve a URL for.
+    pub fn enqueue_all(&mut self, items: Vec<TrackView>) {
+        self.queue.extend(items);
+    }
+
+    pub fn cycle_shuffle(&mut self, counts: Option<&PlayCountStore>) -> ShuffleMode {
+        let next = self.queue.shuffle().cycle();
+        self.queue.apply_shuffle(next, counts);
+        next
+    }
+
+    pub fn set_shuffle(&mut self, mode: ShuffleMode, counts: Option<&PlayCountStore>) {
+        self.queue.apply_shuffle(mode, counts);
+    }
+
+    pub fn cycle_repeat(&mut self) -> RepeatMode {
+        let next = self.queue.repeat().cycle();
+        self.queue.set_repeat(next);
+        let _ = self.backend.set_loop_file(next == RepeatMode::One);
+        next
+    }
+
+    pub fn set_repeat(&mut self, mode: RepeatMode) {
+        self.queue.set_repeat(mode);
+        let _ = self.backend.set_loop_file(mode == RepeatMode::One);
+    }
+
     pub fn select(&mut self, index: usize) -> Option<TrackView> {
         self.queue.set_cursor(index).cloned()
     }
 
-    /// The current queue item (what a URL should be resolved for).
     pub fn current(&self) -> Option<&TrackView> {
         self.queue.current()
     }
 
     /// Begin playing the current queue item from a resolved stream `url`.
     pub fn play_current(&mut self, url: &str) -> Result<()> {
+        self.play_current_with_quality(url, StreamQuality::default())
+    }
+
+    pub fn play_current_with_quality(&mut self, url: &str, quality: StreamQuality) -> Result<()> {
         let Some(track) = self.queue.current().cloned() else {
             return Ok(());
         };
         self.backend.set_volume(self.volume)?;
         self.backend.play(url)?;
+        let _ = self.backend.set_media_title(&track.label());
+        let _ = self
+            .backend
+            .set_loop_file(self.queue.repeat() == RepeatMode::One);
         self.now_playing = Some(track);
         self.status = PlayerStatus::Playing;
+        self.quality = quality;
+        self.listened = 0.0;
+        self.scrobbled = false;
         Ok(())
     }
 
-    /// Toggle between playing and paused.
+    /// Merge decoder-reported params into the advertised stream quality.
+    pub fn refresh_quality(&mut self) {
+        let decoded = self.backend.stream_quality();
+        if decoded.sample_rate_hz.is_some() {
+            self.quality.sample_rate_hz = decoded.sample_rate_hz;
+        }
+        if decoded.bit_depth.is_some() {
+            self.quality.bit_depth = decoded.bit_depth;
+        }
+        if decoded.channels.is_some() {
+            self.quality.channels = decoded.channels;
+        }
+        if decoded.bitrate_bps.is_some() {
+            self.quality.bitrate_bps = decoded.bitrate_bps;
+        }
+        if self.quality.codecs.is_none() {
+            self.quality.codecs = decoded.codecs;
+        }
+    }
+
     pub fn toggle_pause(&mut self) -> Result<()> {
         match self.status {
             PlayerStatus::Playing => self.pause(),
@@ -165,7 +253,6 @@ impl Player {
         }
     }
 
-    /// Pause playback.
     pub fn pause(&mut self) -> Result<()> {
         if self.status == PlayerStatus::Playing {
             self.backend.pause()?;
@@ -174,7 +261,6 @@ impl Player {
         Ok(())
     }
 
-    /// Resume playback.
     pub fn resume(&mut self) -> Result<()> {
         if self.status == PlayerStatus::Paused {
             self.backend.resume()?;
@@ -183,7 +269,6 @@ impl Player {
         Ok(())
     }
 
-    /// Stop playback and clear the now-playing track.
     pub fn stop(&mut self) -> Result<()> {
         self.backend.stop()?;
         self.status = PlayerStatus::Stopped;
@@ -191,31 +276,45 @@ impl Player {
         Ok(())
     }
 
-    /// Set the volume (0–100) and push it to the backend.
     pub fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.volume = volume.min(100);
         self.backend.set_volume(self.volume)?;
         Ok(())
     }
 
-    /// Raise the volume by `step`, saturating at 100.
     pub fn volume_up(&mut self, step: u8) -> Result<()> {
         let v = self.volume.saturating_add(step).min(100);
         self.set_volume(v)
     }
 
-    /// Lower the volume by `step`, saturating at 0.
     pub fn volume_down(&mut self, step: u8) -> Result<()> {
         let v = self.volume.saturating_sub(step);
         self.set_volume(v)
     }
 
-    /// Advance the queue cursor and return the next track to resolve, if any.
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        self.backend.seek(seconds.max(0.0))
+    }
+
+    pub fn seek_by(&mut self, delta: f64) -> Result<()> {
+        let pos = self.position().unwrap_or(0.0);
+        self.seek((pos + delta).max(0.0))
+    }
+
+    pub fn position(&mut self) -> Option<f64> {
+        self.backend.position()
+    }
+
+    pub fn duration(&mut self) -> Option<f64> {
+        self.backend
+            .duration()
+            .or_else(|| self.now_playing.as_ref().map(|t| t.duration_secs as f64))
+    }
+
     pub fn next_track(&mut self) -> Option<TrackView> {
         self.queue.advance().cloned()
     }
 
-    /// Step the queue cursor back and return the previous track to resolve.
     pub fn previous_track(&mut self) -> Option<TrackView> {
         self.queue.previous().cloned()
     }
@@ -230,6 +329,10 @@ impl Player {
             return false;
         }
         if self.backend.poll_finished() {
+            if self.queue.repeat() == RepeatMode::One {
+                // mpv loop-file should have restarted; treat as not finished.
+                return false;
+            }
             if !self.queue.has_next() {
                 self.status = PlayerStatus::Stopped;
                 self.now_playing = None;
@@ -239,7 +342,29 @@ impl Player {
         false
     }
 
-    /// Build a serialisable snapshot of the current state.
+    /// Record listening time; bump play counts once past 50% of the track.
+    pub fn note_progress(&mut self, dt: f64, counts: Option<&mut PlayCountStore>) {
+        if self.status != PlayerStatus::Playing {
+            return;
+        }
+        self.listened += dt.max(0.0);
+        if self.scrobbled {
+            return;
+        }
+        let dur = self
+            .now_playing
+            .as_ref()
+            .map(|t| t.duration_secs as f64)
+            .unwrap_or(0.0);
+        let threshold = if dur > 0.0 { dur * 0.5 } else { 240.0 };
+        if self.listened >= threshold {
+            if let (Some(store), Some(track)) = (counts, self.now_playing.clone()) {
+                store.bump(&track);
+            }
+            self.scrobbled = true;
+        }
+    }
+
     pub fn snapshot(&self) -> PlayerState {
         PlayerState {
             status: self.status,
@@ -250,6 +375,9 @@ impl Player {
             queue_position: self.queue.cursor(),
             has_next: self.queue.has_next(),
             has_previous: self.queue.has_previous(),
+            shuffle: self.queue.shuffle(),
+            repeat: self.queue.repeat(),
+            quality: self.quality.clone(),
         }
     }
 }
@@ -265,8 +393,7 @@ mod tests {
             artist: "Artist".into(),
             album: Some("Album".into()),
             duration_secs: 200,
-            explicit: false,
-            cover: None,
+            ..TrackView::default()
         }
     }
 
@@ -330,8 +457,25 @@ mod tests {
         assert!(snap.has_next);
         assert!(!snap.has_previous);
         assert_eq!(snap.now_playing.map(|t| t.id), Some(1));
-        // snapshot round-trips through JSON (used for the future daemon/IPC)
         let json = serde_json::to_string(&p.snapshot()).unwrap();
         assert!(json.contains("\"status\":\"playing\""));
+        assert!(json.contains("\"shuffle\":\"off\""));
+    }
+
+    #[test]
+    fn note_progress_bumps_playcount_at_halfway() {
+        let dir = std::env::temp_dir().join(format!("tiders-pc-player-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("playcounts.json");
+        let _ = std::fs::remove_file(&path);
+        let mut store = PlayCountStore::load(&path).unwrap();
+        let mut p = null_player();
+        p.set_queue(vec![track(1)], 0);
+        p.play_current("u").unwrap();
+        p.note_progress(50.0, Some(&mut store));
+        assert_eq!(store.get(&track(1)), 0);
+        p.note_progress(60.0, Some(&mut store));
+        assert_eq!(store.get(&track(1)), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

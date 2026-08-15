@@ -46,6 +46,100 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Short list-row badge for a TIDAL `audioQuality` tag.
+pub fn quality_badge(tag: Option<&str>) -> Option<&'static str> {
+    let t = tag.unwrap_or("").to_ascii_uppercase();
+    if t.contains("HI_RES") || t.contains("HIRES") || t == "MAX" {
+        Some("HIRES")
+    } else if t.contains("LOSSLESS") || t.contains("FLAC") {
+        Some("FLAC")
+    } else if t.contains("HIGH") || t.contains("320") {
+        Some("AAC")
+    } else if t.contains("LOW") || t.contains("96") {
+        Some("AAC")
+    } else if t.is_empty() {
+        None
+    } else {
+        None
+    }
+}
+
+/// Pretty-print a decoded stream: `FLAC 24-bit 96 kHz`, `AAC 320 kbps`, …
+pub fn stream_quality_label(q: &crate::model::StreamQuality) -> String {
+    let codec = codec_name(q.codecs.as_deref(), q.mime_type.as_deref(), q.audio_quality.as_deref());
+    let mut parts = vec![codec];
+    if let Some(bits) = q.bit_depth {
+        parts.push(format!("{bits}-bit"));
+    }
+    if let Some(hz) = q.sample_rate_hz {
+        parts.push(format_hz(hz));
+    }
+    if q.sample_rate_hz.is_none() {
+        if let Some(bps) = q.bitrate_bps {
+            if bps >= 1000 {
+                parts.push(format!("{} kbps", (bps + 500) / 1000));
+            }
+        }
+    }
+    if let Some(ch) = q.channels {
+        if ch > 2 {
+            parts.push(format!("{ch}ch"));
+        }
+    }
+    parts.join(" ")
+}
+
+fn codec_name(codecs: Option<&str>, mime: Option<&str>, quality: Option<&str>) -> String {
+    let c = codecs.unwrap_or("").to_ascii_lowercase();
+    let m = mime.unwrap_or("").to_ascii_lowercase();
+    let q = quality.unwrap_or("").to_ascii_uppercase();
+    if c.contains("flac") || m.contains("flac") {
+        if q.contains("HI_RES") {
+            "Hi-Res FLAC".into()
+        } else {
+            "FLAC".into()
+        }
+    } else if c.contains("alac") {
+        "ALAC".into()
+    } else if c.contains("mp4a") || c.contains("aac") || m.contains("mp4") || m.contains("aac") {
+        "AAC".into()
+    } else if !c.is_empty() {
+        c
+    } else if q.contains("HI_RES") {
+        "Hi-Res".into()
+    } else if q.contains("LOSSLESS") {
+        "Lossless".into()
+    } else if q.contains("HIGH") {
+        "AAC".into()
+    } else if q.contains("LOW") {
+        "AAC".into()
+    } else {
+        "Stream".into()
+    }
+}
+
+fn format_hz(hz: u32) -> String {
+    if hz % 1000 == 0 {
+        format!("{} kHz", hz / 1000)
+    } else {
+        format!("{:.1} kHz", hz as f32 / 1000.0)
+    }
+}
+
+/// Infer bit depth from an mpv `audio-params/format` string (`s16`, `s32`, `float`, …).
+pub fn bit_depth_from_format(fmt: &str) -> Option<u8> {
+    let f = fmt.to_ascii_lowercase();
+    if f.contains("s16") || f.contains("u16") {
+        Some(16)
+    } else if f.contains("s24") || f.contains("u24") {
+        Some(24)
+    } else if f.contains("s32") || f.contains("u32") || f.contains("float") || f.contains("dbl") {
+        Some(24) // float/s32 playback of a 24-bit master
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +168,30 @@ mod tests {
         assert_eq!(truncate("hello", 5), "hello");
         assert_eq!(truncate("hello world", 5), "hell…");
         assert_eq!(truncate("hello", 0), "");
+    }
+
+    #[test]
+    fn stream_quality_renders_flac_and_aac() {
+        use crate::model::StreamQuality;
+        let flac = StreamQuality {
+            audio_quality: Some("HI_RES".into()),
+            mime_type: Some("audio/flac".into()),
+            codecs: Some("flac".into()),
+            sample_rate_hz: Some(96000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            bitrate_bps: None,
+        };
+        assert_eq!(stream_quality_label(&flac), "Hi-Res FLAC 24-bit 96 kHz");
+        let aac = StreamQuality {
+            audio_quality: Some("HIGH".into()),
+            mime_type: Some("audio/mp4".into()),
+            codecs: Some("mp4a.40.2".into()),
+            bitrate_bps: Some(320_000),
+            ..StreamQuality::default()
+        };
+        assert_eq!(stream_quality_label(&aac), "AAC 320 kbps");
+        assert_eq!(quality_badge(Some("HI_RES_LOSSLESS")), Some("HIRES"));
+        assert_eq!(bit_depth_from_format("s16"), Some(16));
     }
 }

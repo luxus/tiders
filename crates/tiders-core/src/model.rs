@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::format;
 
 /// A track reduced to what a list row and the now-playing bar need.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackView {
     pub id: u64,
     pub title: String,
@@ -19,6 +19,32 @@ pub struct TrackView {
     pub explicit: bool,
     /// TIDAL cover-art id (dashes); resolve with [`TrackView::cover_url`].
     pub cover: Option<String>,
+    /// TIDAL quality tag (`LOW` / `HIGH` / `LOSSLESS` / `HI_RES` / `HI_RES_LOSSLESS`).
+    pub audio_quality: Option<String>,
+    pub bpm: Option<f32>,
+    pub album_id: Option<u64>,
+    pub artist_id: Option<u64>,
+    /// Mix id for "radio from this track", if TIDAL supplied one.
+    pub mix_id: Option<String>,
+}
+
+impl Default for TrackView {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            title: String::new(),
+            artist: String::new(),
+            album: None,
+            duration_secs: 0,
+            explicit: false,
+            cover: None,
+            audio_quality: None,
+            bpm: None,
+            album_id: None,
+            artist_id: None,
+            mix_id: None,
+        }
+    }
 }
 
 impl TrackView {
@@ -38,6 +64,20 @@ impl TrackView {
             .as_deref()
             .map(|id| crate::images::cover_url(id, size))
     }
+
+    /// Compact quality badge, e.g. `HIRES` / `FLAC` / `AAC`.
+    pub fn quality_badge(&self) -> Option<&'static str> {
+        format::quality_badge(self.audio_quality.as_deref())
+    }
+}
+
+fn mix_id_from(map: &Option<std::collections::HashMap<String, String>>) -> Option<String> {
+    map.as_ref().and_then(|m| {
+        m.get("TRACK_MIX")
+            .or_else(|| m.get("trackMix"))
+            .cloned()
+            .or_else(|| m.values().next().cloned())
+    })
 }
 
 impl From<&tidlers::client::models::track::Track> for TrackView {
@@ -55,6 +95,11 @@ impl From<&tidlers::client::models::track::Track> for TrackView {
             duration_secs: t.duration,
             explicit: t.explicit,
             cover: t.album.as_ref().and_then(|a| a.cover.clone()),
+            audio_quality: Some(t.audio_quality.clone()),
+            bpm: t.bpm,
+            album_id: t.album.as_ref().map(|a| a.id as u64),
+            artist_id: Some(t.artist.id),
+            mix_id: mix_id_from(&t.mixes),
         }
     }
 }
@@ -76,6 +121,11 @@ impl From<&tidlers::client::models::search::SearchTrackHit> for TrackView {
             duration_secs: h.duration,
             explicit: h.explicit,
             cover: h.album.as_ref().map(|a| a.cover.clone()),
+            audio_quality: h.audio_quality.clone(),
+            bpm: None,
+            album_id: h.album.as_ref().map(|a| a.id),
+            artist_id: h.artists.first().and_then(|a| a.id),
+            mix_id: mix_id_from(&h.mixes),
         }
     }
 }
@@ -86,6 +136,9 @@ pub struct AlbumView {
     pub id: u64,
     pub title: String,
     pub artist: String,
+    pub cover: Option<String>,
+    pub release_date: Option<String>,
+    pub tracks: Option<u32>,
 }
 
 impl From<&tidlers::client::models::search::SearchAlbumHit> for AlbumView {
@@ -95,6 +148,22 @@ impl From<&tidlers::client::models::search::SearchAlbumHit> for AlbumView {
             id: h.id,
             title: h.title.clone(),
             artist: format::artists(&names),
+            cover: h.cover.clone(),
+            release_date: h.release_date.clone(),
+            tracks: h.number_of_tracks,
+        }
+    }
+}
+
+impl From<&tidlers::client::models::album::Album> for AlbumView {
+    fn from(a: &tidlers::client::models::album::Album) -> Self {
+        AlbumView {
+            id: a.id as u64,
+            title: a.title.clone(),
+            artist: String::new(),
+            cover: a.cover.clone(),
+            release_date: a.release_date.clone(),
+            tracks: None,
         }
     }
 }
@@ -104,6 +173,8 @@ impl From<&tidlers::client::models::search::SearchAlbumHit> for AlbumView {
 pub struct ArtistView {
     pub id: u64,
     pub name: String,
+    pub picture: Option<String>,
+    pub mix_id: Option<String>,
 }
 
 impl From<&tidlers::client::models::search::SearchArtistHit> for ArtistView {
@@ -111,16 +182,20 @@ impl From<&tidlers::client::models::search::SearchArtistHit> for ArtistView {
         ArtistView {
             id: h.id,
             name: h.name.clone(),
+            picture: h.picture.clone(),
+            mix_id: mix_id_from(&h.mixes),
         }
     }
 }
 
 /// A playlist search hit reduced for display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaylistView {
     pub uuid: String,
     pub title: String,
     pub tracks: u32,
+    pub cover: Option<String>,
+    pub description: Option<String>,
 }
 
 impl From<&tidlers::client::models::search::SearchPlaylistHit> for PlaylistView {
@@ -129,7 +204,53 @@ impl From<&tidlers::client::models::search::SearchPlaylistHit> for PlaylistView 
             uuid: h.uuid.clone(),
             title: h.title.clone(),
             tracks: h.number_of_tracks.unwrap_or(0),
+            cover: h.square_image.clone().or_else(|| h.image.clone()),
+            description: h.description.clone(),
         }
+    }
+}
+
+/// A TIDAL Mix (My Mix, radio mix, arrival mix, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MixView {
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub cover_url: Option<String>,
+}
+
+/// A "For You" / home-feed card that can be opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeCard {
+    pub title: String,
+    pub subtitle: String,
+    pub kind: HomeCardKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HomeCardKind {
+    Mix { id: String },
+    Playlist { uuid: String },
+    Album { id: u64 },
+    Artist { id: u64 },
+}
+
+/// Details of the stream currently (or about to be) decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamQuality {
+    pub audio_quality: Option<String>,
+    pub mime_type: Option<String>,
+    pub codecs: Option<String>,
+    pub sample_rate_hz: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub channels: Option<u8>,
+    pub bitrate_bps: Option<u32>,
+}
+
+impl StreamQuality {
+    /// Human label like `FLAC 24-bit 96 kHz` or `AAC 320 kbps`.
+    pub fn label(&self) -> String {
+        format::stream_quality_label(self)
     }
 }
 
@@ -190,8 +311,14 @@ mod tests {
             duration_secs: 301,
             explicit: false,
             cover: None,
+            audio_quality: Some("LOSSLESS".into()),
+            bpm: Some(124.0),
+            album_id: None,
+            artist_id: None,
+            mix_id: None,
         };
         assert_eq!(tv.label(), "Daft Punk — Digital Love");
         assert_eq!(tv.duration(), "5:01");
+        assert_eq!(tv.quality_badge(), Some("FLAC"));
     }
 }

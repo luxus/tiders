@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::player::BackendKind;
+use crate::queue::{RepeatMode, ShuffleMode};
+use crate::spectrum::EqTheme;
 
 /// Environment variable that overrides the config directory.
 pub const CONFIG_DIR_ENV: &str = "TIDERS_CONFIG_DIR";
@@ -48,6 +50,16 @@ impl Quality {
     /// Short, human-friendly label.
     pub fn label(self) -> &'static str {
         match self {
+            Quality::Low => "Low · AAC 96 kbps",
+            Quality::High => "High · AAC 320 kbps",
+            Quality::Lossless => "Lossless · FLAC 16-bit 44.1 kHz",
+            Quality::HiRes => "Hi-Res · FLAC up to 24-bit 192 kHz",
+        }
+    }
+
+    /// Compact label for chrome / headers.
+    pub fn short_label(self) -> &'static str {
+        match self {
             Quality::Low => "Low",
             Quality::High => "High",
             Quality::Lossless => "Lossless",
@@ -70,6 +82,42 @@ impl std::str::FromStr for Quality {
     }
 }
 
+/// ReplayGain mode passed through to mpv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayGain {
+    #[default]
+    Album,
+    Track,
+    Off,
+}
+
+impl ReplayGain {
+    pub fn mpv_flag(self) -> &'static str {
+        match self {
+            ReplayGain::Album => "album",
+            ReplayGain::Track => "track",
+            ReplayGain::Off => "no",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReplayGain::Album => "album",
+            ReplayGain::Track => "track",
+            ReplayGain::Off => "off",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            ReplayGain::Album => ReplayGain::Track,
+            ReplayGain::Track => ReplayGain::Off,
+            ReplayGain::Off => ReplayGain::Album,
+        }
+    }
+}
+
 /// User-tweakable settings, persisted next to the session as `settings.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,6 +128,13 @@ pub struct Settings {
     pub volume: u8,
     /// Which audio backend to use.
     pub backend: BackendKind,
+    pub shuffle: ShuffleMode,
+    pub repeat: RepeatMode,
+    pub replaygain: ReplayGain,
+    pub eq_theme: EqTheme,
+    pub show_spectrum: bool,
+    /// Crossfade length in seconds (0 = gapless only).
+    pub crossfade_secs: u8,
 }
 
 impl Default for Settings {
@@ -88,6 +143,12 @@ impl Default for Settings {
             quality: Quality::Lossless,
             volume: 90,
             backend: BackendKind::Auto,
+            shuffle: ShuffleMode::Off,
+            repeat: RepeatMode::Off,
+            replaygain: ReplayGain::Album,
+            eq_theme: EqTheme::Tide,
+            show_spectrum: true,
+            crossfade_secs: 0,
         }
     }
 }
@@ -129,6 +190,21 @@ impl Config {
     /// Path to the persisted settings.
     pub fn settings_path(&self) -> PathBuf {
         self.dir.join("settings.json")
+    }
+
+    /// Path to the local play-count store.
+    pub fn playcounts_path(&self) -> PathBuf {
+        self.dir.join("playcounts.json")
+    }
+
+    /// Path to the persisted play queue.
+    pub fn queue_path(&self) -> PathBuf {
+        self.dir.join("queue.json")
+    }
+
+    /// Directory used for temporary cover-art / DASH manifest files.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.dir.join("cache")
     }
 
     /// Ensure the config directory exists.

@@ -24,6 +24,8 @@ thiserror = "2"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+rustfft = "6"
 
 [profile.release]
 strip = true
