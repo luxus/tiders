@@ -82,6 +82,7 @@ jobs:
   publish:
     name: GitHub Release
     needs: build
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write

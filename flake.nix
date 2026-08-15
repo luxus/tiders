@@ -9,10 +9,11 @@
     { self, nixpkgs }:
     let
       inherit (nixpkgs) lib;
+      # nixpkgs 26.11 dropped x86_64-darwin; the overlay still builds there
+      # when applied to an older nixpkgs (e.g. 26.05).
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems = lib.genAttrs systems;
@@ -90,6 +91,6 @@
         }
       );
 
-      formatter = forAllSystems (system: (pkgsFor system).nixfmt-rfc-style);
+      formatter = forAllSystems (system: (pkgsFor system).nixfmt);
     };
 }
