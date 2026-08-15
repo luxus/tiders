@@ -71,13 +71,23 @@ impl AudioBackend for MpvBackend {
         self.ipc_path = unique_ipc_path();
         self.reported_finished = false;
 
-        let child = Command::new("mpv")
+        let mut command = Command::new("mpv");
+        command
             .arg("--no-video")
             .arg("--no-terminal")
             .arg("--really-quiet")
             .arg("--idle=no")
             .arg(format!("--volume={}", self.volume))
-            .arg(format!("--input-ipc-server={}", self.ipc_path.display()))
+            .arg(format!("--input-ipc-server={}", self.ipc_path.display()));
+
+        // Optional audio-output override. Handy on headless machines/CI where
+        // there is no sound device: `TIDERS_MPV_AO=null` decodes the stream in
+        // real time without opening an output. Unset on a normal desktop.
+        if let Some(ao) = std::env::var_os("TIDERS_MPV_AO") {
+            command.arg(format!("--ao={}", ao.to_string_lossy()));
+        }
+
+        let child = command
             .arg("--")
             .arg(url)
             .stdin(Stdio::null())

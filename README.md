@@ -141,7 +141,9 @@ overridable with `--config-dir` or the `TIDERS_CONFIG_DIR` environment variable.
 
 For headless/CI use, a full session JSON can be supplied via the
 `TIDAL_SESSION_JSON` environment variable; Tiders restores and persists it on
-first use.
+first use. On machines without an audio device (CI, servers), set
+`TIDERS_MPV_AO=null` so `mpv` decodes the stream in real time without opening an
+output.
 
 ## Roadmap
 
