@@ -46,6 +46,7 @@
           default = {
             type = "app";
             program = lib.getExe self.packages.${system}.tiders;
+            meta.description = "Tiders — a terminal (TUI + CLI) client for TIDAL";
           };
           tiders = default;
         }
