@@ -73,6 +73,38 @@ impl StreamInfo {
     }
 }
 
+/// TIDAL often caps a favorites page at 50 even when a larger `limit` is sent.
+const COLLECTION_PAGE: u32 = 50;
+
+/// Advance `offset` for a collection listing, or `None` when paging is done.
+///
+/// `raw_n` is how many **entries** the API returned (not how many we parsed).
+/// Stopping on `parsed < requested` dropped the rest of a library whenever one
+/// item failed to decode or the server silently capped `limit`.
+fn next_collection_offset(offset: u32, raw_n: u32, total: Option<u32>, max: u32) -> Option<u32> {
+    let next = offset.saturating_add(raw_n);
+    if raw_n == 0 || next >= max {
+        return None;
+    }
+    if let Some(total) = total {
+        if next >= total {
+            return None;
+        }
+    }
+    Some(next)
+}
+
+fn collection_page(value: &serde_json::Value) -> (Vec<serde_json::Value>, u32, Option<u32>) {
+    let items = value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let raw_n = items.len() as u32;
+    let total = json_u64(value, "totalNumberOfItems").map(|n| n as u32);
+    (items, raw_n, total)
+}
+
 /// High-level TIDAL service used by every front-end.
 pub struct TidalService {
     client: TidalClient,
@@ -234,18 +266,20 @@ impl TidalService {
     }
 
     /// Every song the user has added to their collection (paginated).
+    ///
+    /// Walks `totalNumberOfItems` and advances by the raw page length, not the
+    /// parsed track count — a short parse (or a server `limit` cap below the
+    /// requested size) used to stop after the first page.
     pub async fn favorite_tracks_all(&self, max: u32) -> Result<Vec<TrackView>> {
         self.require_auth()?;
         let mut all = Vec::new();
-        let page = 100u32;
         let mut offset = 0u32;
         loop {
-            let batch = self.favorite_tracks_raw(page, offset).await?;
-            let n = batch.len() as u32;
+            let (batch, raw_n, total) = self.favorite_tracks_page(COLLECTION_PAGE, offset).await?;
             all.extend(batch);
-            offset += n;
-            if n == 0 || n < page || all.len() as u32 >= max {
-                break;
+            match next_collection_offset(offset, raw_n, total, max) {
+                Some(next) => offset = next,
+                None => break,
             }
         }
         // Dedup by id, keep first occurrence (most recently added first from API).
@@ -255,23 +289,32 @@ impl TidalService {
     }
 
     async fn favorite_tracks_raw(&self, limit: u32, offset: u32) -> Result<Vec<TrackView>> {
+        let (batch, _, _) = self.favorite_tracks_page(limit, offset).await?;
+        Ok(batch)
+    }
+
+    async fn favorite_tracks_page(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<TrackView>, u32, Option<u32>)> {
         let (token, user_id, country) = self.auth_triplet()?;
         let url = format!(
             "https://api.tidal.com/v1/users/{user_id}/favorites/tracks?countryCode={country}&limit={limit}&offset={offset}"
         );
         let value = authenticated_json(&token, &url).await?;
-        let items = value
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(items
+        let (items, raw_n, total) = collection_page(&value);
+        let batch = items
             .iter()
             .filter_map(|entry| {
-                let item = entry.get("item").unwrap_or(entry);
+                let item = entry
+                    .get("item")
+                    .or_else(|| entry.get("data"))
+                    .unwrap_or(entry);
                 track_from_json(item)
             })
-            .collect())
+            .collect();
+        Ok((batch, raw_n, total))
     }
 
     /// List the user's own playlists.
@@ -477,35 +520,142 @@ impl TidalService {
     /// Favorite albums.
     pub async fn favorite_albums(&self, limit: u32, offset: u32) -> Result<Vec<AlbumView>> {
         self.require_auth()?;
-        let response = self
+        match self
             .client
             .get_collection_album_favorites(Some(limit), Some(offset))
-            .await?;
-        Ok(response
-            .items
-            .iter()
-            .map(|e| AlbumView::from(&e.item))
-            .collect())
+            .await
+        {
+            Ok(response) => Ok(response
+                .items
+                .iter()
+                .map(|e| AlbumView::from(&e.item))
+                .collect()),
+            Err(_) => {
+                let (batch, _, _) = self.favorite_albums_page(limit, offset).await?;
+                Ok(batch)
+            }
+        }
     }
 
-    /// Favorite / followed artists.
+    /// Every album in the user's collection (paginated).
+    pub async fn favorite_albums_all(&self, max: u32) -> Result<Vec<AlbumView>> {
+        self.require_auth()?;
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let (batch, raw_n, total) = self.favorite_albums_page(COLLECTION_PAGE, offset).await?;
+            all.extend(batch);
+            match next_collection_offset(offset, raw_n, total, max) {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|a| seen.insert(a.id));
+        Ok(all)
+    }
+
+    async fn favorite_albums_page(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<AlbumView>, u32, Option<u32>)> {
+        let (token, user_id, country) = self.auth_triplet()?;
+        let url = format!(
+            "https://api.tidal.com/v1/users/{user_id}/favorites/albums?countryCode={country}&limit={limit}&offset={offset}"
+        );
+        let value = authenticated_json(&token, &url).await?;
+        let (items, raw_n, total) = collection_page(&value);
+        let batch = items
+            .iter()
+            .filter_map(|entry| {
+                let item = entry
+                    .get("item")
+                    .or_else(|| entry.get("data"))
+                    .unwrap_or(entry);
+                album_from_json(item)
+            })
+            .collect();
+        Ok((batch, raw_n, total))
+    }
+
+    /// Favorite / followed ("subscribed") artists.
     pub async fn favorite_artists(&self, limit: u32) -> Result<Vec<ArtistView>> {
         self.require_auth()?;
-        let response = self.client.get_collection_artists(limit).await?;
-        Ok(response
-            .items
+        let (batch, _, _) = self.favorite_artists_page(limit, 0).await?;
+        if !batch.is_empty() {
+            return Ok(batch);
+        }
+        // Folders endpoint used by tidlers often 400s or returns folders, not artists.
+        match self.client.get_collection_artists(limit).await {
+            Ok(response) => Ok(response
+                .items
+                .iter()
+                .filter(|e| !e.item_type.eq_ignore_ascii_case("FOLDER"))
+                .map(|e| ArtistView {
+                    id: e.data.id as u64,
+                    name: e.data.name.clone(),
+                    picture: e.data.picture.clone(),
+                    mix_id: e.data.mixes.as_ref().and_then(|m| {
+                        m.get("ARTIST_MIX")
+                            .cloned()
+                            .or_else(|| m.values().next().cloned())
+                    }),
+                })
+                .collect()),
+            Err(_) => Ok(batch),
+        }
+    }
+
+    /// Every followed / subscribed artist (paginated).
+    pub async fn favorite_artists_all(&self, max: u32) -> Result<Vec<ArtistView>> {
+        self.require_auth()?;
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let (batch, raw_n, total) = self.favorite_artists_page(COLLECTION_PAGE, offset).await?;
+            all.extend(batch);
+            match next_collection_offset(offset, raw_n, total, max) {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        if all.is_empty() {
+            all = self.favorite_artists(max.min(1000)).await?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|a| seen.insert(a.id));
+        Ok(all)
+    }
+
+    async fn favorite_artists_page(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<ArtistView>, u32, Option<u32>)> {
+        let (token, user_id, country) = self.auth_triplet()?;
+        let url = format!(
+            "https://api.tidal.com/v1/users/{user_id}/favorites/artists?countryCode={country}&limit={limit}&offset={offset}"
+        );
+        let value = authenticated_json(&token, &url).await?;
+        let (items, raw_n, total) = collection_page(&value);
+        let batch = items
             .iter()
-            .map(|e| ArtistView {
-                id: e.data.id as u64,
-                name: e.data.name.clone(),
-                picture: e.data.picture.clone(),
-                mix_id: e.data.mixes.as_ref().and_then(|m| {
-                    m.get("ARTIST_MIX")
-                        .cloned()
-                        .or_else(|| m.values().next().cloned())
-                }),
+            .filter_map(|entry| {
+                if json_str(entry, "itemType")
+                    .or_else(|| json_str(entry, "item_type"))
+                    .is_some_and(|t| t.eq_ignore_ascii_case("FOLDER"))
+                {
+                    return None;
+                }
+                let item = entry
+                    .get("item")
+                    .or_else(|| entry.get("data"))
+                    .unwrap_or(entry);
+                artist_from_json(item)
             })
-            .collect())
+            .collect();
+        Ok((batch, raw_n, total))
     }
 
     /// Love (favorite) a track.
@@ -786,17 +936,57 @@ fn track_from_json(v: &serde_json::Value) -> Option<TrackView> {
         bpm: v.get("bpm").and_then(|x| x.as_f64()).map(|n| n as f32),
         album_id,
         artist_id,
-        mix_id: v.get("mixes").and_then(|m| m.as_object()).and_then(|m| {
-            m.get("TRACK_MIX")
-                .or_else(|| m.get("trackMix"))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    m.values()
-                        .next()
-                        .and_then(|x| x.as_str().map(|s| s.to_string()))
-                })
-        }),
+        mix_id: mix_id_from_json(v, "TRACK_MIX", "trackMix"),
+    })
+}
+
+fn mix_id_from_json(v: &serde_json::Value, primary: &str, alt: &str) -> Option<String> {
+    v.get("mixes").and_then(|m| m.as_object()).and_then(|m| {
+        m.get(primary)
+            .or_else(|| m.get(alt))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                m.values()
+                    .next()
+                    .and_then(|x| x.as_str().map(|s| s.to_string()))
+            })
+    })
+}
+
+fn album_from_json(v: &serde_json::Value) -> Option<AlbumView> {
+    let id = json_u64(v, "id")?;
+    let title = json_str(v, "title")?;
+    let artist = v
+        .get("artist")
+        .and_then(|a| json_str(a, "name"))
+        .or_else(|| {
+            v.get("artists")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|a| json_str(a, "name"))
+        })
+        .unwrap_or_default();
+    Some(AlbumView {
+        id,
+        title,
+        artist,
+        cover: json_str(v, "cover"),
+        release_date: json_str(v, "releaseDate").or_else(|| json_str(v, "release_date")),
+        tracks: json_u64(v, "numberOfTracks")
+            .or_else(|| json_u64(v, "number_of_tracks"))
+            .map(|n| n as u32),
+    })
+}
+
+fn artist_from_json(v: &serde_json::Value) -> Option<ArtistView> {
+    let id = json_u64(v, "id")?;
+    let name = json_str(v, "name")?;
+    Some(ArtistView {
+        id,
+        name,
+        picture: json_str(v, "picture"),
+        mix_id: mix_id_from_json(v, "ARTIST_MIX", "artistMix"),
     })
 }
 
@@ -1202,5 +1392,67 @@ mod tests {
         assert_eq!(strip_simple_html("a<br>b<br />c".into()), "a\nb\nc");
         assert_eq!(strip_simple_html("<p>hi &amp; lo</p>".into()), "hi & lo");
         assert_eq!(strip_simple_html("a<br class=\"x\">b".into()), "a\nb");
+    }
+
+    #[test]
+    fn collection_pages_keep_going_when_server_caps_limit() {
+        // Requested 100, server returned 50, total 180 → must continue.
+        assert_eq!(next_collection_offset(0, 50, Some(180), 10_000), Some(50));
+        assert_eq!(next_collection_offset(50, 50, Some(180), 10_000), Some(100));
+        assert_eq!(
+            next_collection_offset(100, 50, Some(180), 10_000),
+            Some(150)
+        );
+        assert_eq!(next_collection_offset(150, 30, Some(180), 10_000), None);
+        assert_eq!(next_collection_offset(0, 0, Some(180), 10_000), None);
+        // Parsed-short must not stop us: raw page was full.
+        assert_eq!(next_collection_offset(0, 50, None, 10_000), Some(50));
+        assert_eq!(
+            next_collection_offset(9_990, 50, Some(20_000), 10_000),
+            None
+        );
+    }
+
+    #[test]
+    fn collection_page_reads_total_and_items() {
+        let v = serde_json::json!({
+            "totalNumberOfItems": 180,
+            "items": [{"item": {"id": 1}}, {"item": {"id": 2}}]
+        });
+        let (items, raw_n, total) = collection_page(&v);
+        assert_eq!(raw_n, 2);
+        assert_eq!(total, Some(180));
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn artist_from_json_reads_followed_artist() {
+        let v = serde_json::json!({
+            "id": 77,
+            "name": "Four Tet",
+            "picture": "aaaa-bbbb",
+            "mixes": {"ARTIST_MIX": "mix123"}
+        });
+        let a = artist_from_json(&v).unwrap();
+        assert_eq!(a.id, 77);
+        assert_eq!(a.name, "Four Tet");
+        assert_eq!(a.picture.as_deref(), Some("aaaa-bbbb"));
+        assert_eq!(a.mix_id.as_deref(), Some("mix123"));
+    }
+
+    #[test]
+    fn album_from_json_reads_nested_artist() {
+        let v = serde_json::json!({
+            "id": 9,
+            "title": "Discovery",
+            "cover": "cccc-dddd",
+            "releaseDate": "2001-03-12",
+            "numberOfTracks": 14,
+            "artist": {"id": 1, "name": "Daft Punk"}
+        });
+        let a = album_from_json(&v).unwrap();
+        assert_eq!(a.id, 9);
+        assert_eq!(a.artist, "Daft Punk");
+        assert_eq!(a.tracks, Some(14));
     }
 }

@@ -88,6 +88,9 @@ pub struct MpvBackend {
     live: Arc<Live>,
     /// Bumped on every respawn so observer / PCM threads exit.
     gen: Arc<AtomicU64>,
+    /// Separate from `gen` so a dead vis sidecar can restart without killing
+    /// the main mpv observer.
+    vis_gen: Arc<AtomicU64>,
 }
 
 impl MpvBackend {
@@ -120,6 +123,7 @@ impl MpvBackend {
             started_file: false,
             live: Arc::new(Live::default()),
             gen: Arc::new(AtomicU64::new(0)),
+            vis_gen: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -194,19 +198,35 @@ impl MpvBackend {
             Arc::clone(&self.gen),
             gen,
         );
-        self.spawn_vis(gen);
+        self.spawn_vis();
         Ok(())
     }
 
-    fn spawn_vis(&mut self, gen: u64) {
+    fn vis_alive(&mut self) -> bool {
+        match self.vis.as_mut() {
+            Some(child) => child.try_wait().ok().flatten().is_none(),
+            None => false,
+        }
+    }
+
+    fn ensure_vis(&mut self) {
+        if pcm_vis_enabled() && !self.vis_alive() {
+            self.spawn_vis();
+        }
+    }
+
+    fn spawn_vis(&mut self) {
         // Second silent mpv dumps decoded PCM into a FIFO for the analyser.
         // Disable with TIDERS_PCM_VIS=0 if the extra process is too heavy.
         if !pcm_vis_enabled() {
-            let _ = gen;
             return;
         }
         #[cfg(unix)]
         {
+            if let Some(mut old) = self.vis.take() {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
             let _ = std::fs::remove_file(&self.vis_ipc);
             let _ = std::fs::remove_file(&self.fifo_path);
             self.vis_ipc = unique_path("vis", "sock");
@@ -223,7 +243,13 @@ impl MpvBackend {
                 .arg("--idle=yes")
                 .arg("--force-window=no")
                 .arg("--input-media-keys=no")
+                // `--ao=pcm` is an untimed AO: `--untimed=no` does not throttle
+                // it. The FIFO reader paces to 44.1 kHz so this sidecar cannot
+                // dump a whole track in ~20s (then go silent while audio plays).
                 .arg("--untimed=no")
+                .arg("--cache=yes")
+                .arg("--demuxer-readahead-secs=15")
+                .arg("--network-timeout=60")
                 .arg("--audio-display=no")
                 .arg("--audio-format=s16")
                 .arg("--audio-samplerate=44100")
@@ -246,22 +272,33 @@ impl MpvBackend {
                 }
             }
 
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                if self.vis_ipc.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let mine = self.vis_gen.fetch_add(1, Ordering::SeqCst) + 1;
             spawn_pcm_reader(
                 self.fifo_path.clone(),
                 Arc::clone(&self.live),
-                Arc::clone(&self.gen),
-                gen,
+                Arc::clone(&self.vis_gen),
+                mine,
             );
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = gen;
         }
     }
 
     fn vis_cmd(&self, command: &serde_json::Value) {
-        if self.vis.is_some() {
-            let _ = send_ipc(&self.vis_ipc, command, None);
+        if self.vis.is_none() {
+            return;
+        }
+        for _ in 0..8 {
+            if send_ipc(&self.vis_ipc, command, None).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -282,6 +319,7 @@ impl MpvBackend {
         let _ = std::fs::remove_file(&self.vis_ipc);
         let _ = std::fs::remove_file(&self.fifo_path);
         self.gen.fetch_add(1, Ordering::SeqCst);
+        self.vis_gen.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut pcm) = self.live.pcm.lock() {
             pcm.clear();
         }
@@ -303,6 +341,7 @@ impl MpvBackend {
 impl AudioBackend for MpvBackend {
     fn play(&mut self, url: &str) -> Result<()> {
         self.ensure_alive()?;
+        self.ensure_vis();
         self.reported_finished = false;
         self.started_file = true;
         self.live.eof.store(false, Ordering::Relaxed);
@@ -682,6 +721,20 @@ fn spawn_pcm_reader(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u
         .ok();
 }
 
+/// How long the FIFO reader should wait so an untimed `--ao=pcm` sidecar
+/// stays locked to wall-clock. Capped so we can notice `vis_gen` changes.
+fn pcm_throttle(emitted: u64, origin: Instant, sample_rate: f64) -> Duration {
+    if emitted == 0 || sample_rate <= 0.0 {
+        return Duration::ZERO;
+    }
+    let ahead = emitted as f64 / sample_rate - origin.elapsed().as_secs_f64();
+    if ahead <= 0.002 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(ahead.min(0.08))
+    }
+}
+
 fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
     let mut raw = vec![0u8; 2048];
     while gen.load(Ordering::Relaxed) == mine {
@@ -691,10 +744,14 @@ fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
             }
             match std::fs::File::open(&fifo) {
                 Ok(f) => break f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
                 Err(_) => std::thread::sleep(Duration::from_millis(40)),
             }
         };
         let mut reader = std::io::BufReader::new(file);
+        let mut origin = Instant::now();
+        let mut emitted = 0u64;
+        let mut last_data = Instant::now();
         while gen.load(Ordering::Relaxed) == mine {
             match reader.read(&mut raw) {
                 Ok(0) => break,
@@ -707,6 +764,11 @@ fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
                     if decoded.is_empty() {
                         continue;
                     }
+                    if last_data.elapsed() > Duration::from_millis(250) {
+                        origin = Instant::now();
+                        emitted = 0;
+                    }
+                    last_data = Instant::now();
                     if let Ok(mut pcm) = live.pcm.lock() {
                         pcm.extend_from_slice(&decoded);
                         // Keep a little more than one FFT window so the UI can drain.
@@ -714,6 +776,14 @@ fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
                         if pcm.len() > max {
                             let skip = pcm.len() - max;
                             pcm.drain(..skip);
+                        }
+                    }
+                    emitted = emitted.saturating_add(decoded.len() as u64);
+                    let delay = pcm_throttle(emitted, origin, 44_100.0);
+                    if !delay.is_zero() {
+                        let until = Instant::now() + delay;
+                        while Instant::now() < until && gen.load(Ordering::Relaxed) == mine {
+                            std::thread::sleep(Duration::from_millis(5));
                         }
                     }
                 }
@@ -789,6 +859,28 @@ fn send_ipc(
     _wait: Option<Duration>,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Null)
+}
+
+#[cfg(test)]
+mod pace_tests {
+    use super::pcm_throttle;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pcm_throttle_is_zero_before_samples() {
+        assert_eq!(pcm_throttle(0, Instant::now(), 44_100.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn pcm_throttle_paces_a_second_of_audio() {
+        let origin = Instant::now();
+        let d = pcm_throttle(44_100, origin, 44_100.0);
+        assert!(
+            d >= Duration::from_millis(50),
+            "expected a real-time wait, got {d:?}"
+        );
+        assert!(d <= Duration::from_millis(80));
+    }
 }
 
 #[cfg(all(test, unix))]
