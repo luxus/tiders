@@ -23,6 +23,33 @@ env:
   BIN: tiders
 
 jobs:
+  cachix:
+    name: Cachix
+    runs-on: ubuntu-latest
+    # Missing CACHIX_AUTH_TOKEN or an unpublished cache must not block GitHub
+    # binary releases.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cachix
+        uses: cachix/cachix-action@v16
+        with:
+          name: tiders
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build
+        run: nix build
+
+      - name: Flake check
+        run: nix flake check
+
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
