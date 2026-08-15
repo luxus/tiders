@@ -65,12 +65,36 @@ impl HitMap {
     }
 
     /// `0.0..=1.0` along the progress bar, or `None` if the click missed it.
+    ///
+    /// `Rect::contains` is exclusive on the right edge, so the last clickable
+    /// column is `x + width - 1`. Map that column to `1.0` so a click at the
+    /// end of the bar seeks to the end of the track.
     pub fn progress_ratio(&self, col: u16) -> Option<f64> {
         let bar = self.progress?;
         if bar.width == 0 {
             return None;
         }
-        let x = col.saturating_sub(bar.x) as f64;
-        Some((x / bar.width as f64).clamp(0.0, 1.0))
+        let x = col.saturating_sub(bar.x).min(bar.width.saturating_sub(1));
+        if bar.width == 1 {
+            return Some(0.0);
+        }
+        Some(x as f64 / (bar.width as f64 - 1.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_ratio_maps_last_cell_to_one() {
+        let hits = HitMap {
+            progress: Some(Rect::new(10, 4, 11, 1)),
+            ..Default::default()
+        };
+        assert!((hits.progress_ratio(10).unwrap() - 0.0).abs() < 1e-9);
+        assert!((hits.progress_ratio(20).unwrap() - 1.0).abs() < 1e-9);
+        assert!(hits.progress_ratio(15).unwrap() > 0.4);
+        assert!(hits.progress_ratio(15).unwrap() < 0.6);
     }
 }
