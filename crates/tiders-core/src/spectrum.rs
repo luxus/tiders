@@ -1,10 +1,9 @@
 //! Real FFT spectrum analyser (cava-style gravity + peak hold).
 //!
 //! Incoming PCM is windowed (Hann), transformed with [`rustfft`], then folded
-//! into log-spaced bands from ~20 Hz to Nyquist. When no PCM has been fed yet
-//! the analyser synthesises a short buffer driven by playback time / BPM /
-//! volume and runs the **same** FFT path — so the visualiser is never a
-//! hand-drawn sine of bar indices.
+//! into log-spaced bands from ~20 Hz to Nyquist. Bars only rise on **fresh**
+//! decoded PCM; silence, pause, or a stale tap lets cava-style gravity pull
+//! them down instead of inventing a synth fallback.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -19,10 +18,14 @@ pub const DEFAULT_BARS: usize = 48;
 /// Assumed sample rate of the PCM tap / synth buffer.
 pub const SAMPLE_RATE: f32 = 44_100.0;
 
-const GRAVITY: f32 = 18.0;
-const PEAK_HOLD: f32 = 0.22;
-const PEAK_FALL: f32 = 1.4;
+const GRAVITY: f32 = 28.0;
+const PEAK_HOLD: f32 = 0.16;
+const PEAK_FALL: f32 = 2.2;
 const SMOOTH: f32 = 1.35;
+/// RMS below this is treated as silence so leftover FFT windows don't freeze.
+const SILENCE_RMS: f32 = 0.012;
+/// Drop the last PCM window if the tap goes quiet for this long.
+const PCM_STALE: Duration = Duration::from_millis(180);
 
 /// Colour theme for the analyser bars (bottom → top gradient stops).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -131,10 +134,9 @@ pub struct Spectrum {
     peak_age: Vec<f32>,
     vel: Vec<f32>,
     n_bars: usize,
-    /// True once real PCM has been pushed (synth fallback is skipped).
+    /// True once real PCM has been pushed.
     has_pcm: bool,
     last_pcm: Option<Instant>,
-    seed: u64,
 }
 
 impl Spectrum {
@@ -163,7 +165,6 @@ impl Spectrum {
             n_bars,
             has_pcm: false,
             last_pcm: None,
-            seed: 0xC0FFEE,
         }
     }
 
@@ -181,12 +182,17 @@ impl Spectrum {
         self.vel.resize(n_bars, 0.0);
     }
 
-    /// Seed the synth fallback so different tracks look distinct.
-    pub fn set_seed(&mut self, seed: u64) {
-        self.seed = seed.max(1);
+    /// Reset analyser state when the playing track changes.
+    pub fn set_seed(&mut self, _seed: u64) {
         self.has_pcm = false;
         self.last_pcm = None;
         self.pcm_len = 0;
+        self.pcm.fill(0.0);
+        self.levels.fill(0.0);
+        self.bars.fill(0.0);
+        self.peaks.fill(0.0);
+        self.vel.fill(0.0);
+        self.peak_age.fill(0.0);
     }
 
     /// Push interleaved-or-mono `f32` samples in `-1.0..=1.0`.
@@ -220,32 +226,42 @@ impl Spectrum {
         self.pcm_len = FFT_SIZE;
     }
 
-    /// Advance by `dt` seconds. `playing` / `volume` / `bpm` / `position` drive
-    /// the synth fallback when no PCM has been fed.
+    /// Advance by `dt` seconds. Bars only pick up energy from a fresh PCM
+    /// window with audible RMS; otherwise gravity falls to zero.
     pub fn tick(
         &mut self,
         dt: f32,
         playing: bool,
         volume: f32,
-        bpm: f32,
-        position: f64,
+        _bpm: f32,
+        _position: f64,
     ) -> SpectrumFrame {
-        if playing {
-            let pcm_fresh = self.has_pcm
-                && self
-                    .last_pcm
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(450));
-            if !pcm_fresh {
-                self.synthesize(position, bpm.max(60.0), volume.clamp(0.0, 1.0));
-            }
+        let pcm_fresh = self.has_pcm && self.last_pcm.is_some_and(|t| t.elapsed() < PCM_STALE);
+        let audible = playing && volume > 0.01 && pcm_fresh && self.pcm_rms() >= SILENCE_RMS;
+        if audible {
             self.transform();
             self.fold_bands();
+        } else {
+            self.levels.fill(0.0);
+            if !pcm_fresh {
+                self.pcm.fill(0.0);
+                self.pcm_len = 0;
+            }
         }
-        self.apply_gravity(dt, playing);
+        self.apply_gravity(dt, audible);
         SpectrumFrame {
             bars: self.bars.clone(),
             peaks: self.peaks.clone(),
         }
+    }
+
+    fn pcm_rms(&self) -> f32 {
+        if self.pcm_len == 0 {
+            return 0.0;
+        }
+        let n = self.pcm_len.min(self.pcm.len());
+        let sum: f32 = self.pcm[..n].iter().map(|s| s * s).sum();
+        (sum / n as f32).sqrt()
     }
 
     /// Last computed frame, without advancing time.
@@ -254,46 +270,6 @@ impl Spectrum {
             bars: self.bars.clone(),
             peaks: self.peaks.clone(),
         }
-    }
-
-    fn synthesize(&mut self, position: f64, bpm: f32, volume: f32) {
-        let t0 = position as f32;
-        let beat = (bpm / 60.0).max(0.5);
-        let kick = {
-            let phase = (t0 * beat).fract();
-            (-phase * 18.0).exp()
-        };
-        for i in 0..FFT_SIZE {
-            let t = t0 + i as f32 / SAMPLE_RATE;
-            let mut s = 0.0f32;
-            // A handful of inharmonic partials unique to the track seed.
-            for p in 0..7u32 {
-                let f = 55.0 * (p + 1) as f32 * (1.0 + ((self.seed >> p) & 7) as f32 * 0.07);
-                let env = 0.35 / (p + 1) as f32;
-                s += env * (2.0 * PI * f * t).sin();
-            }
-            // Filtered noise (hash) for high-band shimmer.
-            let n = hash01(
-                self.seed
-                    .wrapping_add(i as u64)
-                    .wrapping_add((t0 * 100.0) as u64),
-            );
-            s += (n - 0.5) * 0.18;
-            // Kick thump.
-            s += kick * (2.0 * PI * 55.0 * t).sin() * 0.7;
-            // Hi-hat-ish on off-beats.
-            let hat = {
-                let phase = (t * beat * 2.0).fract();
-                if phase < 0.06 {
-                    (n - 0.5) * (1.0 - phase / 0.06)
-                } else {
-                    0.0
-                }
-            };
-            s += hat * 0.45;
-            self.pcm[i] = (s * volume * 0.55).clamp(-1.0, 1.0);
-        }
-        self.pcm_len = FFT_SIZE;
     }
 
     fn transform(&mut self) {
@@ -379,14 +355,6 @@ impl Spectrum {
             }
         }
     }
-}
-
-fn hash01(x: u64) -> f32 {
-    let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
-    (z as f32) / (u64::MAX as f32)
 }
 
 /// Render `height` rows of block characters for `frame`, top-down.
@@ -479,9 +447,46 @@ mod tests {
             spec.has_pcm = true;
             // No new energy.
             spec.pcm.fill(0.0);
-            let _ = spec.tick(0.016, false, 0.0, 120.0, 0.0);
+            spec.pcm_len = FFT_SIZE;
+            let _ = spec.tick(0.016, true, 1.0, 120.0, 0.0);
         }
         let after: f32 = spec.bars.iter().sum();
         assert!(after < before, "bars did not fall ({after} vs {before})");
+        assert!(after < 0.5, "silence should collapse bars, got {after}");
+    }
+
+    #[test]
+    fn stale_pcm_does_not_hold_the_last_frame() {
+        let mut spec = Spectrum::new(16);
+        spec.feed(&[0.8; FFT_SIZE]);
+        let _ = spec.tick(0.008, true, 1.0, 120.0, 0.0);
+        let before: f32 = spec.bars.iter().sum();
+        assert!(before > 0.5, "expected energy from loud PCM, got {before}");
+        spec.last_pcm = Some(Instant::now() - Duration::from_millis(500));
+        for _ in 0..50 {
+            let _ = spec.tick(0.016, true, 1.0, 120.0, 1.0);
+        }
+        let after: f32 = spec.bars.iter().sum();
+        assert!(
+            after < before * 0.2,
+            "stale tap should decay, before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn zero_volume_collapses_bars() {
+        let mut spec = Spectrum::new(16);
+        spec.feed(&[0.9; FFT_SIZE]);
+        let _ = spec.tick(0.008, true, 1.0, 120.0, 0.0);
+        let before: f32 = spec.bars.iter().sum();
+        for _ in 0..40 {
+            spec.feed(&[0.9; 64]);
+            let _ = spec.tick(0.016, true, 0.0, 120.0, 0.0);
+        }
+        let after: f32 = spec.bars.iter().sum();
+        assert!(
+            after < before,
+            "volume 0 should drop bars ({after} vs {before})"
+        );
     }
 }

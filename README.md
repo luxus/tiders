@@ -33,18 +33,18 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
   [FFF](https://github.com/dmtrKovalenko/fff) (`neo_frizbee`). Typo-resistant,
   ranked as you type, with match highlighting. On the Search tab, **Enter** still
   queries the TIDAL catalog.
-- **Library** — your playlists, **My Mixes**, and TIDAL **For You** cards, plus
-  album / artist / playlist drill‑down (bio included). Mixes also have their
-  own tab (`3`).
+- **Library** — saved songs in a sortable table, playlists in a hideable
+  sidebar, **My Mixes**, and TIDAL **For You**, plus album / artist / playlist
+  drill‑down (artist image, top songs, latest albums, bio).
 - **Favorites** — saved tracks, albums, and artists; love / unlove syncs with
-  TIDAL (`l`).
-- **Now‑playing mode** — press `m` for a large cover, synced lyrics, a mini
-  queue, and the spectrum (`Esc` back).
+  TIDAL (`l`). Right-click a track for artist, album, favorite, like, and
+  don't like.
+- **Now‑playing** — compact bar with cover padding, spectrum, and **Up Next**;
+  press `m` for a large cover, synced lyrics, and a clickable scrollable queue
+  (`Esc` back).
 - **Real FFT spectrum** — [rustfft](https://crates.io/crates/rustfft) analyser
-  with cava‑style gravity, peak hold, and EQ themes (`e` / `E`). By default the
-  bars are synthesised from the playing track so a second mpv process is not
-  needed. Set `TIDERS_PCM_VIS=1` to tap decoded PCM from a silent
-  `--ao=pcm` sidecar.
+  with cava‑style gravity and peak hold. Bars follow decoded PCM from the
+  silent `--ao=pcm` sidecar and fall to zero on silence, pause, or a stale tap.
 - **Stream quality** — live decoder details (FLAC / AAC, bit depth, kHz, kbps)
   from TIDAL’s manifest plus mpv’s `audio-params`.
 - **Shuffle & repeat** — shuffle off / random / favourites / discovery (`s`);
@@ -222,11 +222,14 @@ library. Keys:
 | Key | Action |
 |-----|--------|
 | `/` | live-filter the current list (playlists, mixes, favorites, queue, …). On Search, **Enter** also queries the TIDAL catalog |
-| `Tab` / `1` `2` `3` `4` `5` | Search · Library · Mixes · Favorites · Queue |
-| click / drag | click a tab, section, or row (second click on the same row plays); drag the scrubber to seek; wheel moves the selection |
+| `Tab` / `1`–`7` | Search · For You · Mixes · Library · Playlists · Favorites · Queue |
+| `b` / `\` | show / hide the left sidebar |
+| click / drag | sidebar, row, queue, or sort header; second click on a row plays; drag the scrubber to seek; wheel moves the selection |
+| right-click | context menu: go to artist / album, add or remove favorite, like, don't like |
 | `t` | cycle search scope (tracks / albums / artists / playlists) |
-| `S` | cycle Library or Favorites section |
-| `↑`/`↓` or `k`/`j` | move selection |
+| `S` | cycle Favorites section |
+| `o` | cycle table sort (title · artist · album · time); click a header to sort |
+| `↑`/`↓` or `k`/`j` | move selection (queue in now-playing mode) |
 | `Enter` | play, or open playlist / mix / album / artist |
 | `Esc` | back / close / leave now-playing mode |
 | `a` / `A` | add track / add all to queue |
@@ -238,11 +241,11 @@ library. Keys:
 | `r` | cycle repeat (off · all · one) |
 | `R` | start radio from the focused track |
 | `l` | love / unlove |
-| `m` | now-playing mode (big cover, lyrics, mini queue) |
+| `m` | now-playing mode (big cover, lyrics, scrollable queue) |
 | `e` / `E` | toggle spectrum / cycle EQ theme |
 | `d` | track details (cover, BPM, stream quality) |
 | `Q` | change audio quality |
-| `f` | reload library |
+| `f` | reload library, mixes, and For You |
 | `x` | stop |
 | `?` | help |
 | `q` | quit |
@@ -279,8 +282,8 @@ Album art auto‑detects the terminal's image protocol; force one with
 `TIDERS_IMAGE_PROTOCOL=halfblocks|sixel|kitty|iterm2` (half‑blocks works
 everywhere).
 
-Set `TIDERS_PCM_VIS=1` to spawn a second silent mpv that feeds real PCM into
-the spectrum analyser. Leave it unset (the default) to keep CPU down.
+Set `TIDERS_PCM_VIS=0` to skip the silent PCM sidecar if you want to save a
+process; the spectrum then stays at rest instead of inventing motion.
 
 For headless/CI use, a full session JSON can be supplied via the
 `TIDAL_SESSION_JSON` environment variable; Tiders restores and persists it on

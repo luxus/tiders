@@ -216,17 +216,61 @@ impl TidalService {
         Ok(TrackView::from(&track))
     }
 
-    /// Fetch the user's favorite tracks.
+    /// Fetch the user's favorite tracks (one page).
     pub async fn favorite_tracks(&self, limit: u32, offset: u32) -> Result<Vec<TrackView>> {
         self.require_auth()?;
-        let response = self
+        match self
             .client
             .get_collection_track_favorites(Some(limit), Some(offset))
-            .await?;
-        Ok(response
-            .items
+            .await
+        {
+            Ok(response) => Ok(response
+                .items
+                .iter()
+                .map(|e| TrackView::from(&e.item))
+                .collect()),
+            Err(_) => self.favorite_tracks_raw(limit, offset).await,
+        }
+    }
+
+    /// Every song the user has added to their collection (paginated).
+    pub async fn favorite_tracks_all(&self, max: u32) -> Result<Vec<TrackView>> {
+        self.require_auth()?;
+        let mut all = Vec::new();
+        let page = 100u32;
+        let mut offset = 0u32;
+        loop {
+            let batch = self.favorite_tracks_raw(page, offset).await?;
+            let n = batch.len() as u32;
+            all.extend(batch);
+            offset += n;
+            if n == 0 || n < page || all.len() as u32 >= max {
+                break;
+            }
+        }
+        // Dedup by id, keep first occurrence (most recently added first from API).
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|t| seen.insert(t.id));
+        Ok(all)
+    }
+
+    async fn favorite_tracks_raw(&self, limit: u32, offset: u32) -> Result<Vec<TrackView>> {
+        let (token, user_id, country) = self.auth_triplet()?;
+        let url = format!(
+            "https://api.tidal.com/v1/users/{user_id}/favorites/tracks?countryCode={country}&limit={limit}&offset={offset}"
+        );
+        let value = authenticated_json(&token, &url).await?;
+        let items = value
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(items
             .iter()
-            .map(|e| TrackView::from(&e.item))
+            .filter_map(|entry| {
+                let item = entry.get("item").unwrap_or(entry);
+                track_from_json(item)
+            })
             .collect())
     }
 
@@ -370,6 +414,22 @@ impl TidalService {
         Ok(all)
     }
 
+    /// Artist profile (picture, mix id, name).
+    pub async fn artist(&self, artist_id: u64) -> Result<ArtistView> {
+        self.require_auth()?;
+        let a = self.client.get_artist(artist_id.to_string()).await?;
+        Ok(ArtistView {
+            id: a.id,
+            name: a.name,
+            picture: a.picture.or(a.selected_album_cover_fallback),
+            mix_id: a.mixes.as_ref().and_then(|m| {
+                m.get("ARTIST_MIX")
+                    .cloned()
+                    .or_else(|| m.values().next().cloned())
+            }),
+        })
+    }
+
     /// Artist top tracks.
     pub async fn artist_tracks(&self, artist_id: u64) -> Result<Vec<TrackView>> {
         self.require_auth()?;
@@ -468,17 +528,116 @@ impl TidalService {
         Ok(())
     }
 
+    /// Best-effort "don't like" signal so mixes stop recommending the track.
+    pub async fn dislike_track(&self, track_id: u64) -> Result<()> {
+        self.require_auth()?;
+        let (token, _user_id, country) = self.auth_triplet()?;
+        let url =
+            format!("https://api.tidal.com/v1/feedback/track/{track_id}?countryCode={country}");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "feedbackType": "NEGATIVE" }))
+            .send()
+            .await
+            .map_err(|e| Error::other(e.to_string()))?;
+        if resp.status().is_success() || resp.status().as_u16() == 204 {
+            return Ok(());
+        }
+        // Older clients posted to /feedbacks; ignore failures — skip locally anyway.
+        let _ = client
+            .post(format!(
+                "https://api.tidal.com/v1/feedbacks?countryCode={country}"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "itemId": track_id,
+                "itemType": "track",
+                "feedbackType": "NEGATIVE"
+            }))
+            .send()
+            .await;
+        Ok(())
+    }
+
     /// Mixes + playlists pulled from the home feed ("My Mixes" and "For You").
+    ///
+    /// The typed home-feed parser is brittle (new module types fail the whole
+    /// response). We try it first, then fall back to the phone feed, pages, and
+    /// a recursive JSON walk so signed-in users still see mixes.
     pub async fn home_cards(&self) -> Result<(Vec<MixView>, Vec<HomeCard>)> {
         self.require_auth()?;
-        let feed = self.client.get_home_feed(50).await?;
         let mut mixes = Vec::new();
         let mut cards = Vec::new();
-        for item in &feed.items {
-            collect_home_item(item, &mut mixes, &mut cards);
+
+        if let Ok(feed) = self.client.get_home_feed(50).await {
+            for item in &feed.items {
+                collect_home_item(item, &mut mixes, &mut cards);
+            }
         }
-        let mut seen = std::collections::HashSet::new();
-        mixes.retain(|m| seen.insert(m.id.clone()));
+        if mixes.is_empty() && cards.is_empty() {
+            if let Ok(feed) = self.client.get_home_feed_phone(50).await {
+                for item in &feed.items {
+                    collect_home_item(item, &mut mixes, &mut cards);
+                }
+            }
+        }
+
+        for slug in ["mixes", "for_you", "home", "explore"] {
+            if let Ok(page) = self.client.get_page(slug).await {
+                if let Ok(value) = serde_json::to_value(&page) {
+                    walk_json(&value, &mut mixes, &mut cards, 0);
+                }
+            }
+        }
+
+        // Typed page/feed parsers often fail on new module shapes. Walk the
+        // raw JSON so signed-in users still get Mixes and For You.
+        if mixes.is_empty() || cards.is_empty() {
+            if let Ok((token, _, country)) = self.auth_triplet() {
+                let urls = [
+                    format!(
+                        "https://api.tidal.com/v1/pages/mixes?countryCode={country}&deviceType=BROWSER&locale=en_US"
+                    ),
+                    format!(
+                        "https://api.tidal.com/v1/pages/for_you?countryCode={country}&deviceType=BROWSER&locale=en_US"
+                    ),
+                    format!(
+                        "https://api.tidal.com/v1/pages/home?countryCode={country}&deviceType=BROWSER&locale=en_US"
+                    ),
+                    format!(
+                        "https://tidal.com/v2/home/feed/static?countryCode={country}&deviceType=BROWSER&platform=WEB&limit=50"
+                    ),
+                ];
+                for url in urls {
+                    if let Ok(value) = authenticated_json(&token, &url).await {
+                        walk_json(&value, &mut mixes, &mut cards, 0);
+                    }
+                    if !mixes.is_empty() && !cards.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Ok(arrivals) = self.client.get_arrival_mixes().await {
+            for (i, mix) in arrivals.data.iter().enumerate() {
+                if mixes.iter().any(|m| m.id == mix.id) {
+                    continue;
+                }
+                mixes.push(MixView {
+                    id: mix.id.clone(),
+                    title: format!("Arrival Mix {}", i + 1),
+                    subtitle: "New arrivals".into(),
+                    cover_url: None,
+                });
+            }
+        }
+
+        dedup_home(&mut mixes, &mut cards);
         Ok((mixes, cards))
     }
 
@@ -538,6 +697,250 @@ impl TidalService {
             Err(Error::NotAuthenticated)
         }
     }
+
+    fn auth_triplet(&self) -> Result<(String, u64, String)> {
+        let token = self
+            .client
+            .session
+            .auth
+            .access_token
+            .clone()
+            .ok_or(Error::NotAuthenticated)?;
+        let user_id = self
+            .client
+            .session
+            .auth
+            .user_id
+            .ok_or(Error::NotAuthenticated)?;
+        let country = self.country().unwrap_or_else(|| "US".into());
+        Ok((token, user_id, country))
+    }
+}
+
+async fn authenticated_json(token: &str, url: &str) -> Result<serde_json::Value> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| Error::other(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(Error::other(format!("tidal http {}", resp.status())));
+    }
+    resp.json().await.map_err(|e| Error::other(e.to_string()))
+}
+
+fn json_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn json_u64(v: &serde_json::Value, key: &str) -> Option<u64> {
+    v.get(key).and_then(|x| {
+        x.as_u64()
+            .or_else(|| x.as_i64().map(|n| n as u64))
+            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+fn json_text_info(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|info| json_str(info, "text").or_else(|| info.as_str().map(|s| s.to_string())))
+        .filter(|s| !s.is_empty())
+}
+
+fn track_from_json(v: &serde_json::Value) -> Option<TrackView> {
+    let id = json_u64(v, "id")?;
+    let title = json_str(v, "title").unwrap_or_else(|| "Track".into());
+    let artist = v
+        .get("artist")
+        .and_then(|a| json_str(a, "name"))
+        .or_else(|| {
+            v.get("artists")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|a| json_str(a, "name"))
+        })
+        .unwrap_or_default();
+    let album = v.get("album").and_then(|a| json_str(a, "title"));
+    let album_id = v.get("album").and_then(|a| json_u64(a, "id"));
+    let cover = v.get("album").and_then(|a| json_str(a, "cover"));
+    let artist_id = v.get("artist").and_then(|a| json_u64(a, "id")).or_else(|| {
+        v.get("artists")
+            .and_then(|a| a.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|a| json_u64(a, "id"))
+    });
+    Some(TrackView {
+        id,
+        title,
+        artist,
+        album,
+        duration_secs: json_u64(v, "duration").unwrap_or(0),
+        explicit: v.get("explicit").and_then(|x| x.as_bool()).unwrap_or(false),
+        cover,
+        audio_quality: json_str(v, "audioQuality"),
+        bpm: v.get("bpm").and_then(|x| x.as_f64()).map(|n| n as f32),
+        album_id,
+        artist_id,
+        mix_id: v.get("mixes").and_then(|m| m.as_object()).and_then(|m| {
+            m.get("TRACK_MIX")
+                .or_else(|| m.get("trackMix"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    m.values()
+                        .next()
+                        .and_then(|x| x.as_str().map(|s| s.to_string()))
+                })
+        }),
+    })
+}
+
+fn walk_json(
+    value: &serde_json::Value,
+    mixes: &mut Vec<MixView>,
+    cards: &mut Vec<HomeCard>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_json(item, mixes, cards, depth + 1);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let wrapped = map.get("item").or_else(|| map.get("data"));
+            if let Some(inner) = wrapped {
+                consider_catalog_object(
+                    inner,
+                    map.get("type").and_then(|t| t.as_str()),
+                    mixes,
+                    cards,
+                );
+                walk_json(inner, mixes, cards, depth + 1);
+            } else {
+                consider_catalog_object(
+                    value,
+                    map.get("type").and_then(|t| t.as_str()),
+                    mixes,
+                    cards,
+                );
+            }
+            for (k, v) in map {
+                if matches!(k.as_str(), "item" | "data") {
+                    continue;
+                }
+                walk_json(v, mixes, cards, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn consider_catalog_object(
+    v: &serde_json::Value,
+    type_hint: Option<&str>,
+    mixes: &mut Vec<MixView>,
+    cards: &mut Vec<HomeCard>,
+) {
+    let hint = type_hint.unwrap_or("").to_ascii_uppercase();
+    let own_type = json_str(v, "type")
+        .or_else(|| json_str(v, "mixType"))
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let kind = if hint.is_empty() { own_type } else { hint };
+
+    let title = json_str(v, "title")
+        .or_else(|| json_text_info(v, "titleTextInfo"))
+        .or_else(|| json_str(v, "name"));
+    let subtitle = json_str(v, "subTitle")
+        .or_else(|| json_str(v, "subtitle"))
+        .or_else(|| json_text_info(v, "subtitleTextInfo"))
+        .unwrap_or_default();
+
+    if kind.contains("MIX") || v.get("mixType").is_some() || v.get("titleTextInfo").is_some() {
+        if let Some(id) = json_str(v, "id") {
+            if id.len() >= 8 {
+                let cover_url = v
+                    .get("mixImages")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|img| json_str(img, "url"))
+                    .or_else(|| {
+                        v.get("images")
+                            .and_then(|img| img.get("SMALL").or_else(|| img.get("MEDIUM")))
+                            .and_then(|img| json_str(img, "url"))
+                    });
+                mixes.push(MixView {
+                    id: id.clone(),
+                    title: title.clone().unwrap_or_else(|| "Mix".into()),
+                    subtitle: subtitle.clone(),
+                    cover_url,
+                });
+                cards.push(HomeCard {
+                    title: title.unwrap_or_else(|| "Mix".into()),
+                    subtitle,
+                    kind: HomeCardKind::Mix { id },
+                });
+                return;
+            }
+        }
+    }
+    if kind.contains("PLAYLIST") {
+        if let Some(uuid) = json_str(v, "uuid").or_else(|| json_str(v, "id")) {
+            if uuid.contains('-') {
+                cards.push(HomeCard {
+                    title: title.unwrap_or_else(|| "Playlist".into()),
+                    subtitle: json_u64(v, "numberOfTracks")
+                        .map(|n| format!("{n} tracks"))
+                        .unwrap_or(subtitle),
+                    kind: HomeCardKind::Playlist { uuid },
+                });
+            }
+        }
+        return;
+    }
+    if kind.contains("ALBUM") {
+        if let Some(id) = json_u64(v, "id") {
+            cards.push(HomeCard {
+                title: title.unwrap_or_else(|| "Album".into()),
+                subtitle,
+                kind: HomeCardKind::Album { id },
+            });
+        }
+        return;
+    }
+    if kind.contains("ARTIST") {
+        if let Some(id) = json_u64(v, "id") {
+            cards.push(HomeCard {
+                title: title.unwrap_or_else(|| "Artist".into()),
+                subtitle: "Artist".into(),
+                kind: HomeCardKind::Artist { id },
+            });
+        }
+    }
+}
+
+fn dedup_home(mixes: &mut Vec<MixView>, cards: &mut Vec<HomeCard>) {
+    let mut seen_mix = std::collections::HashSet::new();
+    mixes.retain(|m| seen_mix.insert(m.id.clone()));
+    let mut seen_card = std::collections::HashSet::new();
+    cards.retain(|c| {
+        let key = match &c.kind {
+            HomeCardKind::Mix { id } => format!("mix:{id}"),
+            HomeCardKind::Playlist { uuid } => format!("pl:{uuid}"),
+            HomeCardKind::Album { id } => format!("al:{id}"),
+            HomeCardKind::Artist { id } => format!("ar:{id}"),
+        };
+        seen_card.insert(key)
+    });
 }
 
 fn strip_simple_html(s: String) -> String {
@@ -741,6 +1144,53 @@ mod tests {
             .block_on(TidalService::restore(cfg, Quality::Lossless))
             .unwrap();
         assert!(restored.is_none());
+    }
+
+    #[test]
+    fn walk_json_finds_mixes_and_playlists() {
+        let payload = serde_json::json!([
+            {
+                "type": "MIX",
+                "item": {
+                    "id": "000abc123def4567890",
+                    "title": "My Mix 1",
+                    "subTitle": "Updated today"
+                }
+            },
+            {
+                "type": "PLAYLIST",
+                "item": {
+                    "uuid": "11111111-2222-3333-4444-555555555555",
+                    "title": "Discover Weekly",
+                    "numberOfTracks": 30
+                }
+            }
+        ]);
+        let mut mixes = Vec::new();
+        let mut cards = Vec::new();
+        walk_json(&payload, &mut mixes, &mut cards, 0);
+        dedup_home(&mut mixes, &mut cards);
+        assert_eq!(mixes.len(), 1);
+        assert_eq!(mixes[0].title, "My Mix 1");
+        assert!(cards.iter().any(|c| c.title == "Discover Weekly"));
+    }
+
+    #[test]
+    fn track_from_json_reads_nested_album() {
+        let v = serde_json::json!({
+            "id": 42,
+            "title": "Fast Car",
+            "duration": 297,
+            "explicit": false,
+            "artist": {"id": 7, "name": "Tracy Chapman"},
+            "album": {"id": 9, "title": "Greatest Hits", "cover": "aaaa-bbbb"}
+        });
+        let t = track_from_json(&v).unwrap();
+        assert_eq!(t.id, 42);
+        assert_eq!(t.artist, "Tracy Chapman");
+        assert_eq!(t.album.as_deref(), Some("Greatest Hits"));
+        assert_eq!(t.artist_id, Some(7));
+        assert_eq!(t.album_id, Some(9));
     }
 
     #[test]

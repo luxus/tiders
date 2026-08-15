@@ -169,6 +169,16 @@ impl From<&tidlers::client::models::search::SearchArtistHit> for ArtistView {
     }
 }
 
+impl ArtistView {
+    /// Public artist image URL at `size`×`size`.
+    pub fn picture_url(&self, size: u32) -> Option<String> {
+        self.picture
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(|id| crate::images::cover_url(id, size))
+    }
+}
+
 /// A playlist search hit reduced for display.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaylistView {

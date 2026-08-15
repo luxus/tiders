@@ -44,6 +44,7 @@ impl ArtManager {
     }
 
     /// The active protocol type (for display in the UI).
+    #[allow(dead_code)]
     pub fn protocol_label(&self) -> &'static str {
         match self.picker.protocol_type() {
             ProtocolType::Halfblocks => "halfblocks",

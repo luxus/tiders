@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 
 use tiders_core::config::Config;
 
-use app::{Popup, Screen, Tab, FRAME};
+use app::{Focus, Popup, Screen, Tab, FRAME};
 use art::ArtManager;
 use hits::Hit;
 
@@ -163,7 +163,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         Screen::Login => handle_login_key(app, key),
         Screen::Browse => {
             if app.popup_open() {
-                handle_popup_key(app, key);
+                handle_popup_key(app, key).await;
             } else {
                 handle_browse_key(app, key).await;
             }
@@ -180,13 +180,20 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_popup_key(app: &mut App, key: KeyEvent) {
+async fn handle_popup_key(app: &mut App, key: KeyEvent) {
     match &app.popup {
         Some(Popup::Quality) => match key.code {
             KeyCode::Up | KeyCode::Char('k') => app.quality_move(-1),
             KeyCode::Down | KeyCode::Char('j') => app.quality_move(1),
             KeyCode::Enter => app.apply_quality(),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => app.close_popup(),
+            _ => {}
+        },
+        Some(Popup::Context(_)) => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.context_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.context_move(1),
+            KeyCode::Enter => app.context_activate().await,
+            KeyCode::Esc | KeyCode::Char('q') => app.close_popup(),
             _ => {}
         },
         _ => {
@@ -269,10 +276,14 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('1') => app.set_tab(Tab::Search),
-        KeyCode::Char('2') => app.set_tab(Tab::Library),
+        KeyCode::Char('2') => app.set_tab(Tab::Home),
         KeyCode::Char('3') => app.set_tab(Tab::Mixes),
-        KeyCode::Char('4') => app.set_tab(Tab::Favorites),
-        KeyCode::Char('5') => app.set_tab(Tab::Queue),
+        KeyCode::Char('4') => app.set_tab(Tab::Library),
+        KeyCode::Char('5') => app.set_tab(Tab::Playlists),
+        KeyCode::Char('6') => app.set_tab(Tab::Favorites),
+        KeyCode::Char('7') => app.set_tab(Tab::Queue),
+        KeyCode::Char('b') | KeyCode::Char('\\') => app.toggle_sidebar(),
+        KeyCode::Char('o') => app.cycle_sort(),
         KeyCode::Char('t') => {
             if app.tab == Tab::Search && app.nav.is_empty() {
                 app.search_scope = app.search_scope.cycle();
@@ -281,25 +292,33 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('S') => {
-            if app.nav.is_empty() {
-                match app.tab {
-                    Tab::Library => {
-                        app.lib_section = app.lib_section.cycle();
-                        app.recompute_filter();
-                        app.select_first();
-                    }
-                    Tab::Favorites => {
-                        app.fav_section = app.fav_section.cycle();
-                        app.recompute_filter();
-                        app.select_first();
-                    }
-                    _ => {}
-                }
+            if app.nav.is_empty() && app.tab == Tab::Favorites {
+                app.fav_section = app.fav_section.cycle();
+                app.recompute_filter();
+                app.select_first();
             }
         }
-        KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
-        KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-        KeyCode::Enter => app.activate().await,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.now_playing_mode || app.focus == Focus::NpQueue {
+                app.move_np_queue(1);
+            } else {
+                app.move_selection(1);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.now_playing_mode || app.focus == Focus::NpQueue {
+                app.move_np_queue(-1);
+            } else {
+                app.move_selection(-1);
+            }
+        }
+        KeyCode::Enter => {
+            if app.now_playing_mode || app.focus == Focus::NpQueue {
+                app.activate_np_queue().await;
+            } else {
+                app.activate().await;
+            }
+        }
         KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('n') => app.play_next().await,
         KeyCode::Char('p') => app.play_previous().await,
@@ -319,7 +338,6 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') => app.stop(),
         KeyCode::Char('f') => {
             app.load_library().await;
-            app.set_tab(Tab::Favorites);
         }
         _ => {}
     }
@@ -327,6 +345,23 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
 
 async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if app.screen != Screen::Browse {
+        return;
+    }
+    if matches!(app.popup, Some(Popup::Context(_))) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(Hit::ContextItem(i)) = app.hits.at(mouse.column, mouse.row) {
+                    if let Some(Popup::Context(menu)) = app.popup.as_mut() {
+                        menu.cursor = i;
+                    }
+                    app.context_activate().await;
+                } else {
+                    app.close_popup();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => app.close_popup(),
+            _ => {}
+        }
         return;
     }
     if app.popup_open() {
@@ -337,8 +372,54 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.move_selection(-1),
-        MouseEventKind::ScrollDown => app.move_selection(1),
+        MouseEventKind::ScrollUp => {
+            if app.hits.queue.is_some_and(|r| {
+                r.contains(ratatui::layout::Position {
+                    x: mouse.column,
+                    y: mouse.row,
+                })
+            }) || app.now_playing_mode
+            {
+                app.move_np_queue(-1);
+            } else {
+                app.move_selection(-1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.hits.queue.is_some_and(|r| {
+                r.contains(ratatui::layout::Position {
+                    x: mouse.column,
+                    y: mouse.row,
+                })
+            }) || app.now_playing_mode
+            {
+                app.move_np_queue(1);
+            } else {
+                app.move_selection(1);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            let Some(hit) = app.hits.at(mouse.column, mouse.row) else {
+                return;
+            };
+            let track = match hit {
+                Hit::ListRow(i) => {
+                    app.select_index(i);
+                    app.selected_track()
+                }
+                Hit::QueueRow(i) => {
+                    app.np_queue_state.select(Some(i));
+                    app.player.queue().items().get(i).cloned()
+                }
+                Hit::UpNext => app.player.queue().peek_next().cloned(),
+                _ => app
+                    .selected_track()
+                    .or_else(|| app.player.now_playing().cloned()),
+            };
+            if let Some(track) = track {
+                app.open_context(mouse.column, mouse.row, track);
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
             let Some(hit) = app.hits.at(mouse.column, mouse.row) else {
                 return;
@@ -349,14 +430,31 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         app.set_tab(tab);
                     }
                 }
-                Hit::Lib(sec) => {
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        app.set_lib_section(sec);
-                    }
-                }
                 Hit::Fav(sec) => {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         app.set_fav_section(sec);
+                    }
+                }
+                Hit::SidebarToggle => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.toggle_sidebar();
+                    }
+                }
+                Hit::Sort(key) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.set_sort(key);
+                    }
+                }
+                Hit::AlbumRow(i) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.open_page_album(i).await;
+                    }
+                }
+                Hit::Playlist(i) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        if let Some(p) = app.playlists.get(i).cloned() {
+                            app.open_playlist(p.uuid, p.title).await;
+                        }
                     }
                 }
                 Hit::ListRow(i) => {
@@ -368,11 +466,27 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         }
                     }
                 }
+                Hit::QueueRow(i) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        let already = app.np_queue_state.selected() == Some(i);
+                        app.np_queue_state.select(Some(i));
+                        app.focus = Focus::NpQueue;
+                        if already {
+                            app.activate_np_queue().await;
+                        }
+                    }
+                }
+                Hit::UpNext => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.play_next().await;
+                    }
+                }
                 Hit::Progress => {
                     if let Some(ratio) = app.hits.progress_ratio(mouse.column) {
                         app.seek_ratio(ratio);
                     }
                 }
+                Hit::ContextItem(_) => {}
             }
         }
         _ => {}
