@@ -255,7 +255,7 @@ mod macos {
             let distant_past: *mut Object = msg_send![class!(NSDate), distantPast];
             let mode: *mut Object = msg_send![
                 class!(NSString),
-                stringWithUTF8String: b"kCFRunLoopDefaultMode\0".as_ptr()
+                stringWithUTF8String: c"kCFRunLoopDefaultMode".as_ptr()
             ];
             loop {
                 let event: *mut Object = msg_send![

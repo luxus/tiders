@@ -35,3 +35,8 @@ objc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+# `objc` 0.2's `msg_send!` / `class!` probe `feature = "cargo-clippy"`. Without
+# this, `clippy -D warnings` on macOS fails with unexpected_cfgs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
