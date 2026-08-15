@@ -4,6 +4,7 @@
   rustPlatform,
   makeWrapper,
   mpv,
+  ffmpeg,
   libiconv,
 }:
 
@@ -42,7 +43,7 @@ rustPlatform.buildRustPackage {
   doCheck = true;
 
   postInstall = ''
-    wrapProgram $out/bin/tiders --prefix PATH : ${lib.makeBinPath [ mpv ]}
+    wrapProgram $out/bin/tiders --prefix PATH : ${lib.makeBinPath [ mpv ffmpeg ]}
   '';
 
   meta = {

@@ -34,7 +34,7 @@ souvlaki = "0.8"
 objc = "0.2"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
 
 # `objc` 0.2's `msg_send!` / `class!` probe `feature = "cargo-clippy"`. Without
 # this, `clippy -D warnings` on macOS fails with unexpected_cfgs.

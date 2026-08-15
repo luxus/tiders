@@ -66,7 +66,7 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
   with terminal synchronized updates so frames don't tear. Input runs on its own
   OS thread so the UI never blocks on mpv IPC.
 - **Scriptable CLI** — `login`, `search`, `play`, `favorites`, `playlists`,
-  `whoami`, `logout`.
+  `download`, `daemon` / `ctl`, `whoami`, `logout`.
 - **Secure device‑code login** — OAuth device flow; the session is stored under
   your platform config dir and refreshed automatically.
 - **Gapless streaming** — a persistent `mpv` (`--idle=yes --gapless-audio=yes`)
@@ -96,10 +96,30 @@ crates/
 ```
 
 **Why this split?** The GUI comes later. `tiders-core` exposes a serialisable
-[`PlayerState`] and a self‑contained `Player`, so a future **daemon** (and, for
-example, a **Noctalia/KWin plugin** or an MPRIS bridge) can drive playback
-through the exact same types without duplicating logic. The `mpv` process model
-is the same seam the desktop version would use.
+[`PlayerState`] / [`EngineState`] and a command bus (`EngineCommand` /
+`EngineEvent`), so a **daemon**, a **Noctalia** plugin, and later a **Sendspin**
+or **Music Assistant** adapter all drive the same session and audio backend.
+
+```
+  TUI  CLI  Noctalia plugin         Sendspin / Music Assistant (later)
+    \   |   /                       controller · metadata · artwork ·
+     EngineCommand / EngineEvent    visualizer · player  (thin adapters)
+              |
+         tiders engine              (session, queue, DASH stitch, downloads)
+              |
+    ┌─────────┴──────────┐
+    mpv AudioBackend     Unix IPC + MPRIS
+    (Sendspin player     $XDG_RUNTIME_DIR/tiders.sock
+     sink later)
+```
+
+Sendspin and Music Assistant are **not** implemented yet. The IPC hello frame
+advertises those role names so a future crate can translate `controller@v1`
+messages onto `EngineCommand` and `metadata` / `visualizer` events onto
+`EngineEvent` without a second player. Music Assistant already speaks Sendspin
+natively, so one Sendspin client adapter covers “Tiders as an MA player or
+wall display”. A Sendspin *server* (Tiders sourcing audio to MA speakers) is
+a separate `AudioBackend` later.
 
 ## Install
 
@@ -260,6 +280,10 @@ tiders favorites --limit 25      # your favorite tracks
 tiders playlists                 # your playlists
 tiders play 66035607             # stream a track by id (needs mpv)
 tiders --quality hires play 12345
+tiders download playlist aa692128-2954-4fe1-b5a1-4ede1add485d
+tiders download track 66035607 --dest ~/Music/Tiders
+tiders daemon                    # background engine (IPC + MPRIS)
+tiders ctl play-pause            # drive the daemon (Noctalia / scripts)
 tiders logout
 ```
 
@@ -274,6 +298,8 @@ Global flags: `--quality low|high|lossless|hires` and `--config-dir <DIR>`
 | `<config>/tiders/settings.json` | quality, volume, shuffle, repeat, EQ theme |
 | `<config>/tiders/playcounts.json` | local play counts (weighted shuffle) |
 | `<config>/tiders/queue.json` | persisted play queue |
+| `$XDG_RUNTIME_DIR/tiders.sock` | daemon IPC socket (`TIDERS_SOCK` / `--socket`) |
+| `~/Music/Tiders/` | default download directory |
 
 `<config>` is `~/.config` on Linux and `~/Library/Application Support` on macOS,
 overridable with `--config-dir` or the `TIDERS_CONFIG_DIR` environment variable.
@@ -318,9 +344,14 @@ Settings → Actions → General → Workflow permissions.
 
 ## Roadmap
 
-- Hi‑Res DASH assembly (segment stitching) for the `hires` tier.
-- A background **daemon** with an IPC control socket, so GUI front‑ends such as
-  a **Noctalia** plugin can drive the same engine (MPRIS is already in-process).
+- Sendspin client transport (`controller` / `metadata` / `artwork` /
+  `visualizer` / `player` roles) so Music Assistant can discover Tiders, and
+  a Sendspin `AudioBackend` if Tiders should source audio to MA speakers.
+- A Noctalia plugin that talks to `tiders daemon` over the IPC socket.
+
+The Hi-Res DASH stitcher and the IPC daemon are in this tree: see
+`tiders-core::dash`, `tiders-core::engine`, `tiders daemon`, and
+`tiders download`.
 
 ## Acknowledgements
 

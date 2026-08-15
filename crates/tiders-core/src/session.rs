@@ -174,6 +174,12 @@ impl TidalService {
         self.quality
     }
 
+    /// Switch the catalog/stream quality used by subsequent requests.
+    pub fn set_quality(&mut self, quality: Quality) {
+        self.quality = quality;
+        self.client.set_audio_quality(quality.to_api());
+    }
+
     /// Begin the OAuth device-code flow: returns the URL + code to show the user.
     pub async fn begin_device_login(&mut self) -> Result<DeviceLogin> {
         let oauth = self.client.get_oauth_link().await?;
@@ -334,26 +340,46 @@ impl TidalService {
             .collect())
     }
 
-    /// Tracks in a user/catalog playlist.
+    /// Tracks in a user/catalog playlist (every page).
     pub async fn playlist_tracks(&self, uuid: &str) -> Result<Vec<TrackView>> {
         self.require_auth()?;
         use tidlers::client::models::playlist::PlaylistItemsOrder;
         use tidlers::client::models::OrderDirection;
-        let response = self
-            .client
-            .get_playlist_items(
-                uuid.to_string(),
-                Some(100),
-                Some(0),
-                Some(PlaylistItemsOrder::Index),
-                Some(OrderDirection::Ascending),
-            )
-            .await?;
-        Ok(response
-            .items
-            .iter()
-            .map(|e| TrackView::from(&e.item))
-            .collect())
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let response = self
+                .client
+                .get_playlist_items(
+                    uuid.to_string(),
+                    Some(COLLECTION_PAGE as u64),
+                    Some(offset as u64),
+                    Some(PlaylistItemsOrder::Index),
+                    Some(OrderDirection::Ascending),
+                )
+                .await?;
+            let raw_n = response.items.len() as u32;
+            let total = Some(response.total_number_of_items as u32);
+            all.extend(response.items.iter().map(|e| TrackView::from(&e.item)));
+            match next_collection_offset(offset, raw_n, total, 50_000) {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// Playlist metadata by UUID.
+    pub async fn playlist(&self, uuid: &str) -> Result<PlaylistView> {
+        self.require_auth()?;
+        let p = self.client.get_playlist(uuid.to_string()).await?;
+        Ok(PlaylistView {
+            uuid: p.uuid.clone(),
+            title: p.title.clone(),
+            tracks: p.number_of_tracks as u32,
+            cover: Some(p.square_image.clone()).filter(|s| !s.is_empty()),
+            description: Some(p.description.clone()).filter(|s| !s.is_empty()),
+        })
     }
 
     /// Tracks in a TIDAL mix.
@@ -792,10 +818,33 @@ impl TidalService {
     }
 
     /// Resolve a track id into a playable stream URL at the given quality.
+    ///
+    /// Hi-Res DASH manifests are rewritten to a static MPD in the cache so
+    /// mpv fetches every fragment; a single init-segment URL is not enough.
     pub async fn stream_url(&mut self, id: u64, quality: Quality) -> Result<StreamInfo> {
+        self.stream_url_with_duration(id, quality, 0).await
+    }
+
+    /// Like [`Self::stream_url`] but sizes the DASH segment run from a known
+    /// duration (avoids over-fetching on playback MPD duration).
+    pub async fn stream_url_for(
+        &mut self,
+        track: &TrackView,
+        quality: Quality,
+    ) -> Result<StreamInfo> {
+        self.stream_url_with_duration(track.id, quality, track.duration_secs)
+            .await
+    }
+
+    /// Raw playback-info (JSON or DASH) used by the downloader and streamer.
+    pub async fn playback_info(
+        &mut self,
+        id: u64,
+        quality: Quality,
+    ) -> Result<tidlers::client::models::track::playback::TrackPlaybackInfoResponse> {
         self.require_auth()?;
         self.client.set_audio_quality(quality.to_api());
-        let playback = self
+        Ok(self
             .client
             .get_track_postpaywall_playback_info(
                 id.to_string(),
@@ -804,9 +853,29 @@ impl TidalService {
                     ..Default::default()
                 }),
             )
-            .await?;
+            .await?)
+    }
 
-        let url = playback.get_primary_url().ok_or(Error::NoStream)?;
+    pub async fn stream_url_with_duration(
+        &mut self,
+        id: u64,
+        quality: Quality,
+        duration_secs: u64,
+    ) -> Result<StreamInfo> {
+        let playback = self.playback_info(id, quality).await?;
+
+        let url = match &playback.manifest_parsed {
+            Some(tidlers::client::models::track::playback::ParsedTrackManifest::Dash(dash)) => {
+                let path = crate::dash::write_playback_mpd(
+                    &self.config.cache_dir(),
+                    id,
+                    dash,
+                    duration_secs,
+                )?;
+                crate::dash::file_url(&path)?
+            }
+            _ => playback.get_primary_url().ok_or(Error::NoStream)?,
+        };
         let mut quality = StreamQuality {
             audio_quality: Some(playback.audio_quality.clone()),
             mime_type: playback.get_mime_type(),
