@@ -859,9 +859,7 @@ impl App {
         if let Some(id) = cover.as_ref() {
             let url = tiders_core::images::cover_url(id, 320);
             if let Ok(bytes) = tiders_core::images::fetch(&url).await {
-                let path = std::env::temp_dir()
-                    .join(format!("tiders-cover-{}-{id}.jpg", std::process::id()));
-                if std::fs::write(&path, bytes).is_ok() {
+                if let Some(path) = write_exclusive_cover(id, &bytes) {
                     self.media_cover_url = tiders_core::media::file_url(&path);
                     self.media_cover_path = Some(path);
                 }
@@ -1497,4 +1495,28 @@ fn spawn_login(config: Config, quality: Quality) -> LoginState {
         status: "Requesting a device code from TIDAL…".into(),
         error: None,
     }
+}
+
+/// Write cover bytes to a new file in the temp dir. `create_new` refuses to
+/// follow/overwrite an existing path (including a symlink planted in `/tmp`).
+fn write_exclusive_cover(cover_id: &str, bytes: &[u8]) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "tiders-cover-{}-{cover_id}-{stamp}.jpg",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    if file.write_all(bytes).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(path)
 }
