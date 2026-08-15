@@ -8,9 +8,13 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc::unbounded_channel;
 
 use tiders_core::config::{Config, Quality, Settings};
+use tiders_core::download::{self, DownloadStatus};
+use tiders_core::engine::ipc;
+use tiders_core::engine::EngineCommand;
 use tiders_core::tidlers::client::oauth::OAuthStatus;
 use tiders_core::{Player, PlayerStatus, TidalService};
 
+use crate::daemon;
 use crate::output;
 use crate::tui;
 
@@ -60,8 +64,73 @@ pub enum Command {
     },
     /// List your playlists.
     Playlists,
+    /// Download tracks, a playlist, or an album (Hi-Res DASH is stitched).
+    Download {
+        #[command(subcommand)]
+        target: DownloadTarget,
+        /// Output directory (default: ~/Music/Tiders/<name>).
+        #[arg(long, global = true, value_name = "DIR")]
+        dest: Option<PathBuf>,
+    },
+    /// Run the background engine (IPC socket + MPRIS).
+    Daemon {
+        /// Unix socket path (default: $XDG_RUNTIME_DIR/tiders.sock).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Send a command to a running daemon.
+    Ctl {
+        /// Unix socket path (default: $XDG_RUNTIME_DIR/tiders.sock).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: CtlAction,
+    },
     /// Launch the interactive terminal UI (default).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DownloadTarget {
+    /// Download every track in a playlist (UUID or tidal.com URL).
+    Playlist { id: String },
+    /// Download a single track by id.
+    Track { track_id: u64 },
+    /// Download every track on an album.
+    Album { album_id: u64 },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CtlAction {
+    Status,
+    Play,
+    Pause,
+    #[command(name = "play-pause")]
+    PlayPause,
+    Stop,
+    Next,
+    Previous,
+    Seek {
+        seconds: f64,
+    },
+    Volume {
+        volume: u8,
+    },
+    #[command(name = "play-track")]
+    PlayTrack {
+        track_id: u64,
+    },
+    #[command(name = "play-playlist")]
+    PlayPlaylist {
+        uuid: String,
+    },
+    #[command(name = "download-playlist")]
+    DownloadPlaylist {
+        uuid: String,
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
+    Quit,
 }
 
 /// Parse arguments and run the selected command.
@@ -118,6 +187,9 @@ async fn dispatch(
             Ok(())
         }
         Command::Play { track_id } => play(config, settings, quality, track_id).await,
+        Command::Download { target, dest } => download_cmd(config, quality, target, dest).await,
+        Command::Daemon { socket } => daemon::run(config, settings, socket).await,
+        Command::Ctl { socket, action } => ctl(socket, action).await,
         Command::Tui => unreachable!("handled in run()"),
     }
 }
@@ -195,7 +267,7 @@ async fn whoami(config: Config, quality: Quality) -> Result<()> {
 async fn play(config: Config, settings: Settings, quality: Quality, track_id: u64) -> Result<()> {
     let mut service = require_service(config, quality).await?;
     let track = service.track(track_id).await?;
-    let stream = service.stream_url(track_id, quality).await?;
+    let stream = service.stream_url_for(&track, quality).await?;
 
     let mut player = Player::with_backend(settings.backend, settings.volume)?;
     player.set_queue(vec![track.clone()], 0);
@@ -239,6 +311,171 @@ async fn play(config: Config, settings: Settings, quality: Quality, track_id: u6
         if player.status() == PlayerStatus::Stopped {
             break;
         }
+    }
+    Ok(())
+}
+
+async fn download_cmd(
+    config: Config,
+    quality: Quality,
+    target: DownloadTarget,
+    dest: Option<PathBuf>,
+) -> Result<()> {
+    let mut service = require_service(config, quality).await?;
+    let (tracks, folder) = match target {
+        DownloadTarget::Playlist { id } => {
+            let uuid = download::parse_playlist_id(&id).to_string();
+            let meta = service.playlist(&uuid).await.ok();
+            let title = meta
+                .as_ref()
+                .map(|p| sanitize_dir(&p.title))
+                .unwrap_or_else(|| uuid.clone());
+            let tracks = service.playlist_tracks(&uuid).await?;
+            if tracks.is_empty() {
+                return Err(anyhow!("playlist is empty"));
+            }
+            println!(
+                "Downloading playlist “{}” ({} tracks) at {}…",
+                meta.as_ref().map(|p| p.title.as_str()).unwrap_or(&uuid),
+                tracks.len(),
+                quality.short_label()
+            );
+            (tracks, title)
+        }
+        DownloadTarget::Track { track_id } => {
+            let track = service.track(track_id).await?;
+            let folder = sanitize_dir(&track.title);
+            println!(
+                "Downloading {} at {}…",
+                track.label(),
+                quality.short_label()
+            );
+            (vec![track], folder)
+        }
+        DownloadTarget::Album { album_id } => {
+            let tracks = service.album_tracks(album_id).await?;
+            if tracks.is_empty() {
+                return Err(anyhow!("album has no tracks"));
+            }
+            let folder = tracks
+                .first()
+                .and_then(|t| t.album.as_deref())
+                .map(sanitize_dir)
+                .unwrap_or_else(|| format!("album-{album_id}"));
+            println!(
+                "Downloading album “{folder}” ({} tracks) at {}…",
+                tracks.len(),
+                quality.short_label()
+            );
+            (tracks, folder)
+        }
+    };
+    let dest = dest.unwrap_or_else(|| download::default_dest().join(folder));
+    let report =
+        download::download_tracks(&mut service, &tracks, &dest, quality, |p| match &p.status {
+            DownloadStatus::Start => {
+                println!("  [{}/{}] {}", p.index, p.total, p.track.label());
+            }
+            DownloadStatus::Done => {
+                println!("       → {}", p.path.display());
+            }
+            DownloadStatus::Skip => {
+                println!("       skip (exists) {}", p.path.display());
+            }
+            DownloadStatus::Failed(e) => {
+                println!("       ✗ {e}");
+            }
+        })
+        .await?;
+    println!(
+        "\n  {} saved, {} skipped, {} failed  → {}\n",
+        report.ok(),
+        report.items.iter().filter(|i| i.skipped).count(),
+        report.failed(),
+        report.dest.display()
+    );
+    if report.failed() > 0 {
+        Err(anyhow!("{} track(s) failed", report.failed()))
+    } else {
+        Ok(())
+    }
+}
+
+fn sanitize_dir(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches([' ', '.']).trim();
+    if trimmed.is_empty() {
+        "tiders".into()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
+}
+
+async fn ctl(socket: Option<PathBuf>, action: CtlAction) -> Result<()> {
+    let path = socket.unwrap_or_else(ipc::socket_path);
+    let cmd = match action {
+        CtlAction::Status => EngineCommand::Status,
+        CtlAction::Play => EngineCommand::Play,
+        CtlAction::Pause => EngineCommand::Pause,
+        CtlAction::PlayPause => EngineCommand::PlayPause,
+        CtlAction::Stop => EngineCommand::Stop,
+        CtlAction::Next => EngineCommand::Next,
+        CtlAction::Previous => EngineCommand::Previous,
+        CtlAction::Seek { seconds } => EngineCommand::Seek { seconds },
+        CtlAction::Volume { volume } => EngineCommand::SetVolume { volume },
+        CtlAction::PlayTrack { track_id } => EngineCommand::PlayTrack { id: track_id },
+        CtlAction::PlayPlaylist { uuid } => EngineCommand::PlayPlaylist {
+            uuid: download::parse_playlist_id(&uuid).to_string(),
+        },
+        CtlAction::DownloadPlaylist { uuid, dest } => EngineCommand::DownloadPlaylist {
+            uuid: download::parse_playlist_id(&uuid).to_string(),
+            dest,
+        },
+        CtlAction::Quit => EngineCommand::Quit,
+    };
+    let reply = ipc::send(&path, cmd)
+        .await
+        .with_context(|| format!("talking to daemon at {}", path.display()))?;
+    if !reply.ok {
+        return Err(anyhow!(
+            "{}",
+            reply.error.unwrap_or_else(|| "daemon error".into())
+        ));
+    }
+    if let Some(state) = reply.state {
+        println!(
+            "{}  vol {}  queue {}  {}",
+            match state.player.status {
+                PlayerStatus::Playing => "playing",
+                PlayerStatus::Paused => "paused",
+                PlayerStatus::Stopped => "stopped",
+            },
+            state.player.volume,
+            state.player.queue_len,
+            state
+                .player
+                .now_playing
+                .as_ref()
+                .map(|t| t.label())
+                .unwrap_or_default()
+        );
+        if state.duration_secs > 0.0 {
+            println!(
+                "  {:.0}/{:.0}s  {}",
+                state.position_secs,
+                state.duration_secs,
+                state.player.quality.label()
+            );
+        }
+    } else {
+        println!("ok");
     }
     Ok(())
 }

@@ -964,7 +964,7 @@ impl App {
         let Some(service) = self.service.as_mut() else {
             return;
         };
-        let stream = service.stream_url(track.id, quality).await;
+        let stream = service.stream_url_for(&track, quality).await;
         match stream {
             Ok(info) => match self
                 .player

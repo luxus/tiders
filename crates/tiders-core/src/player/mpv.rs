@@ -39,6 +39,8 @@ struct Live {
     paused: AtomicBool,
     /// Unix millis when `time_pos` was last stamped (for interpolation).
     pos_millis: AtomicU64,
+    /// False until mpv reports a real `time-pos` after `loadfile`.
+    pos_valid: AtomicBool,
     samplerate: AtomicU32,
     channels: AtomicU32,
     bit_depth: AtomicU32,
@@ -47,17 +49,28 @@ struct Live {
     format: Mutex<Option<String>>,
     /// Decoded PCM from the visualiser tap (mono f32, ~44.1 kHz).
     pcm: Mutex<Vec<f32>>,
+    /// Playback position (seconds) that corresponds to `emitted == 0` in the
+    /// PCM reader. Seek / play bump [`Self::vis_epoch`] so the reader resets.
+    vis_origin: AtomicU64,
+    vis_epoch: AtomicU64,
+    /// Requested vis sidecar seek (f64 bits). `NAN` means none.
+    vis_seek: AtomicU64,
 }
 
 impl Live {
     fn stamp_pos(&self, seconds: f64) {
         self.time_pos.store(seconds.to_bits(), Ordering::Relaxed);
         self.pos_millis.store(unix_millis(), Ordering::Relaxed);
+        self.pos_valid.store(true, Ordering::Relaxed);
+    }
+
+    fn raw_time_pos(&self) -> f64 {
+        f64::from_bits(self.time_pos.load(Ordering::Relaxed))
     }
 
     fn time_pos(&self) -> Option<f64> {
-        let raw = f64::from_bits(self.time_pos.load(Ordering::Relaxed));
-        if self.paused.load(Ordering::Relaxed) {
+        let raw = self.raw_time_pos();
+        if self.paused.load(Ordering::Relaxed) || !self.pos_valid.load(Ordering::Relaxed) {
             return Some(raw);
         }
         let stamped = self.pos_millis.load(Ordering::Relaxed);
@@ -71,6 +84,12 @@ impl Live {
     fn duration(&self) -> Option<f64> {
         let v = f64::from_bits(self.duration.load(Ordering::Relaxed));
         (v > 0.0).then_some(v)
+    }
+
+    fn reset_vis_clock(&self, origin: f64) {
+        self.vis_origin.store(origin.to_bits(), Ordering::Relaxed);
+        self.vis_epoch.fetch_add(1, Ordering::SeqCst);
+        self.vis_seek.store(f64::NAN.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -91,6 +110,7 @@ pub struct MpvBackend {
     /// Separate from `gen` so a dead vis sidecar can restart without killing
     /// the main mpv observer.
     vis_gen: Arc<AtomicU64>,
+    current_url: Option<String>,
 }
 
 impl MpvBackend {
@@ -121,9 +141,14 @@ impl MpvBackend {
             replaygain: replaygain.to_string(),
             reported_finished: false,
             started_file: false,
-            live: Arc::new(Live::default()),
+            live: {
+                let live = Arc::new(Live::default());
+                live.vis_seek.store(f64::NAN.to_bits(), Ordering::Relaxed);
+                live
+            },
             gen: Arc::new(AtomicU64::new(0)),
             vis_gen: Arc::new(AtomicU64::new(0)),
+            current_url: None,
         })
     }
 
@@ -347,7 +372,13 @@ impl AudioBackend for MpvBackend {
         self.live.eof.store(false, Ordering::Relaxed);
         self.live.idle.store(false, Ordering::Relaxed);
         self.live.paused.store(false, Ordering::Relaxed);
-        self.live.stamp_pos(0.0);
+        self.live.pos_valid.store(false, Ordering::Relaxed);
+        self.live
+            .time_pos
+            .store(0.0f64.to_bits(), Ordering::Relaxed);
+        self.live.pos_millis.store(0, Ordering::Relaxed);
+        self.live.reset_vis_clock(0.0);
+        self.current_url = Some(url.to_string());
         if let Ok(mut pcm) = self.live.pcm.lock() {
             pcm.clear();
         }
@@ -430,6 +461,7 @@ impl AudioBackend for MpvBackend {
             let _ = self.send_command(&serde_json::json!(["seek", seconds, "absolute"]));
             self.vis_cmd(&serde_json::json!(["seek", seconds, "absolute"]));
             self.live.stamp_pos(seconds.max(0.0));
+            self.live.reset_vis_clock(seconds.max(0.0));
             if let Ok(mut pcm) = self.live.pcm.lock() {
                 pcm.clear();
             }
@@ -497,6 +529,23 @@ impl AudioBackend for MpvBackend {
     }
 
     fn drain_pcm(&mut self, dst: &mut Vec<f32>) {
+        let seek = f64::from_bits(
+            self.live
+                .vis_seek
+                .swap(f64::NAN.to_bits(), Ordering::Relaxed),
+        );
+        if seek.is_finite() {
+            if let Some(url) = &self.current_url {
+                self.vis_cmd(&serde_json::json!([
+                    "loadfile",
+                    url,
+                    "replace",
+                    0,
+                    format!("start={seek}")
+                ]));
+                self.live.reset_vis_clock(seek.max(0.0));
+            }
+        }
         dst.clear();
         if let Ok(mut pcm) = self.live.pcm.lock() {
             dst.extend_from_slice(&pcm);
@@ -591,6 +640,7 @@ fn observer_loop(ipc: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) 
             serde_json::json!(["observe_property", 5, "audio-params"]),
             serde_json::json!(["observe_property", 6, "audio-codec-name"]),
             serde_json::json!(["observe_property", 7, "audio-bitrate"]),
+            serde_json::json!(["observe_property", 8, "pause"]),
         ];
         for cmd in &observes {
             let req_id = REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -670,6 +720,12 @@ fn apply_ipc_event(live: &Live, v: &serde_json::Value) {
                 *g = data.and_then(|d| d.as_str().map(str::to_string));
             }
         }
+        "pause" => {
+            live.paused.store(
+                data.and_then(|d| d.as_bool()).unwrap_or(false),
+                Ordering::Relaxed,
+            );
+        }
         "audio-bitrate" => {
             if let Some(b) = data.and_then(|d| d.as_f64()) {
                 live.bitrate.store(b.max(0.0) as u32, Ordering::Relaxed);
@@ -721,8 +777,19 @@ fn spawn_pcm_reader(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u
         .ok();
 }
 
-/// How long the FIFO reader should wait so an untimed `--ao=pcm` sidecar
-/// stays locked to wall-clock. Capped so we can notice `vis_gen` changes.
+/// How long the FIFO reader should wait so PCM stays locked to the **main**
+/// player's clock (not wall-time from when the sidecar happened to start).
+fn pcm_throttle_to_clock(vis_pos: f64, main_pos: f64) -> Duration {
+    let ahead = vis_pos - main_pos;
+    if ahead <= 0.002 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(ahead.min(0.08))
+    }
+}
+
+/// Legacy helper kept for tests that describe the old wall-clock pacer.
+#[cfg(test)]
 fn pcm_throttle(emitted: u64, origin: Instant, sample_rate: f64) -> Duration {
     if emitted == 0 || sample_rate <= 0.0 {
         return Duration::ZERO;
@@ -749,13 +816,19 @@ fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
             }
         };
         let mut reader = std::io::BufReader::new(file);
-        let mut origin = Instant::now();
+        let mut epoch = live.vis_epoch.load(Ordering::Relaxed);
+        let mut origin = f64::from_bits(live.vis_origin.load(Ordering::Relaxed));
         let mut emitted = 0u64;
-        let mut last_data = Instant::now();
         while gen.load(Ordering::Relaxed) == mine {
             match reader.read(&mut raw) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let now_epoch = live.vis_epoch.load(Ordering::Relaxed);
+                    if now_epoch != epoch {
+                        epoch = now_epoch;
+                        origin = f64::from_bits(live.vis_origin.load(Ordering::Relaxed));
+                        emitted = 0;
+                    }
                     let mut decoded = Vec::with_capacity(n / 2);
                     for chunk in raw[..n].chunks_exact(2) {
                         let s = i16::from_le_bytes([chunk[0], chunk[1]]);
@@ -764,14 +837,29 @@ fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
                     if decoded.is_empty() {
                         continue;
                     }
-                    if last_data.elapsed() > Duration::from_millis(250) {
-                        origin = Instant::now();
-                        emitted = 0;
+                    let main_pos = live.time_pos().unwrap_or(0.0);
+                    let vis_pos = origin + emitted as f64 / 44_100.0;
+                    let lag = main_pos - vis_pos;
+                    if lag > 1.0 {
+                        live.vis_seek.store(main_pos.to_bits(), Ordering::Relaxed);
+                        if let Ok(mut pcm) = live.pcm.lock() {
+                            pcm.clear();
+                        }
+                        continue;
                     }
-                    last_data = Instant::now();
+                    if lag > 0.25 {
+                        let skip = ((lag - 0.05) * 44_100.0) as usize;
+                        let skip = skip.min(decoded.len());
+                        if skip > 0 {
+                            decoded.drain(..skip);
+                            emitted = emitted.saturating_add(skip as u64);
+                        }
+                        if decoded.is_empty() {
+                            continue;
+                        }
+                    }
                     if let Ok(mut pcm) = live.pcm.lock() {
                         pcm.extend_from_slice(&decoded);
-                        // Keep a little more than one FFT window so the UI can drain.
                         let max = 8192;
                         if pcm.len() > max {
                             let skip = pcm.len() - max;
@@ -779,7 +867,8 @@ fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
                         }
                     }
                     emitted = emitted.saturating_add(decoded.len() as u64);
-                    let delay = pcm_throttle(emitted, origin, 44_100.0);
+                    let vis_pos = origin + emitted as f64 / 44_100.0;
+                    let delay = pcm_throttle_to_clock(vis_pos, live.time_pos().unwrap_or(vis_pos));
                     if !delay.is_zero() {
                         let until = Instant::now() + delay;
                         while Instant::now() < until && gen.load(Ordering::Relaxed) == mine {
@@ -863,7 +952,7 @@ fn send_ipc(
 
 #[cfg(test)]
 mod pace_tests {
-    use super::pcm_throttle;
+    use super::{pcm_throttle, pcm_throttle_to_clock};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -880,6 +969,18 @@ mod pace_tests {
             "expected a real-time wait, got {d:?}"
         );
         assert!(d <= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn vis_waits_when_ahead_of_the_player_clock() {
+        let d = pcm_throttle_to_clock(5.0, 4.5);
+        assert!(d >= Duration::from_millis(50));
+        assert!(d <= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn vis_does_not_wait_when_behind_the_player_clock() {
+        assert_eq!(pcm_throttle_to_clock(1.0, 1.4), Duration::ZERO);
     }
 }
 

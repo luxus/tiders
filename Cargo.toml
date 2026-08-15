@@ -18,7 +18,7 @@ tiders-core = { path = "crates/tiders-core" }
 # TIDAL API client (up-to-date fork on Codeberg)
 tidlers = { git = "https://codeberg.org/tomkoid/tidlers.git" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

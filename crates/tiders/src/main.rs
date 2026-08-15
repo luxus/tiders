@@ -5,6 +5,7 @@
 //! [`tiders_core`] engine.
 
 mod cli;
+mod daemon;
 mod output;
 mod tui;
 

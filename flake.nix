@@ -86,6 +86,7 @@
               rustfmt
               rust-analyzer
               mpv
+              ffmpeg
             ];
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
