@@ -203,6 +203,12 @@ tiders            # launches the interactive UI (default)
 tiders tui
 ```
 
+Without installing Tiders, the same TUI is:
+
+```sh
+nix run github:luxus/tiders
+```
+
 If you are not signed in, the TUI shows a **device‑login** screen with a URL and
 a code — open the URL, enter the code, approve, and it drops you into your
 library. Keys:
