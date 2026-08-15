@@ -1,0 +1,30 @@
+[package]
+name = "tiders"
+description = "Tiders — a terminal (TUI + CLI) client for the TIDAL music streaming service."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+default-run = "tiders"
+
+[[bin]]
+name = "tiders"
+path = "src/main.rs"
+
+[dependencies]
+tiders-core.workspace = true
+tidlers.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+open = "5"
+unicode-width = "0.2"
