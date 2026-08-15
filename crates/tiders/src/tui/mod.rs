@@ -1,32 +1,39 @@
 //! The interactive terminal UI.
 
+mod anim;
 mod app;
 mod art;
+mod filter;
 mod theme;
 mod ui;
 
 pub use app::App;
 
-use std::io;
-use std::time::Duration;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use tokio::sync::mpsc;
+use tokio::time::{interval, MissedTickBehavior};
 
 use tiders_core::config::Config;
 
-use app::{Popup, Screen, View};
+use app::{Popup, Screen, Tab, FRAME};
 use art::ArtManager;
 
 /// Launch the TUI against the given config, restoring the terminal on exit.
 pub async fn run(config: Config) -> Result<()> {
-    // Detect terminal image capability BEFORE touching the alternate screen.
     let art = ArtManager::new();
     let mut app = App::bootstrap(config, art).await?;
 
@@ -45,34 +52,83 @@ pub async fn run(config: Config) -> Result<()> {
     result
 }
 
-async fn event_loop<B: ratatui::backend::Backend>(
+/// Dedicated OS thread for input — grok-build's workaround for crossterm
+/// stranding `EventStream` wakers when the future is dropped inside `select!`.
+fn spawn_input_thread(tx: mpsc::UnboundedSender<KeyEvent>, stop: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("tiders-input".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match crossterm::event::poll(Duration::from_millis(16)) {
+                    Ok(true) => match crossterm::event::read() {
+                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            if tx.send(key).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .ok();
+}
+
+async fn event_loop<B: ratatui::backend::Backend + Write>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<()> {
-    loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+    let (key_tx, mut key_rx) = mpsc::unbounded_channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_input_thread(key_tx, Arc::clone(&stop));
 
-        let maybe_event = tokio::task::block_in_place(|| -> Result<Option<Event>> {
-            if event::poll(Duration::from_millis(100))? {
-                Ok(Some(event::read()?))
-            } else {
-                Ok(None)
-            }
-        })?;
+    let mut frames = interval(FRAME);
+    frames.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last = Instant::now();
+    let mut last_idle_draw = Instant::now();
+    let mut dirty = true;
 
-        if let Some(Event::Key(key)) = maybe_event {
-            if key.kind == KeyEventKind::Press {
-                handle_key(app, key).await;
-            }
+    let result = loop {
+        if dirty {
+            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            dirty = false;
         }
 
-        app.on_tick().await;
+        tokio::select! {
+            biased;
+            maybe = key_rx.recv() => {
+                match maybe {
+                    Some(key) => {
+                        handle_key(app, key).await;
+                        dirty = true;
+                    }
+                    None => break Ok(()),
+                }
+            }
+            _ = frames.tick() => {
+                let now = Instant::now();
+                let dt = now.saturating_duration_since(last).as_secs_f32();
+                last = now;
+                app.on_frame(dt).await;
+                if app.needs_frames() || last_idle_draw.elapsed() >= Duration::from_millis(250) {
+                    dirty = true;
+                    last_idle_draw = now;
+                }
+            }
+        }
 
         if app.should_quit {
-            break;
+            break Ok(());
         }
-    }
-    Ok(())
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    result
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) {
@@ -112,7 +168,6 @@ fn handle_popup_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         _ => {
-            // Help / Detail: any of these dismiss.
             if matches!(
                 key.code,
                 KeyCode::Esc
@@ -130,49 +185,118 @@ fn handle_popup_key(app: &mut App, key: KeyEvent) {
 async fn handle_browse_key(app: &mut App, key: KeyEvent) {
     if app.input_mode {
         match key.code {
-            KeyCode::Enter => app.submit_search().await,
-            KeyCode::Esc => app.input_mode = false,
+            KeyCode::Enter => {
+                if app.tab == Tab::Search && app.nav.is_empty() && !app.input.trim().is_empty() {
+                    app.submit_search().await;
+                } else {
+                    app.input_mode = false;
+                    app.activate().await;
+                }
+            }
+            KeyCode::Esc => {
+                if !app.input.is_empty() {
+                    app.clear_filter();
+                    app.select_first();
+                } else {
+                    app.input_mode = false;
+                }
+            }
             KeyCode::Backspace => {
                 app.input.pop();
+                app.recompute_filter();
+                app.select_first();
             }
-            KeyCode::Char(c) => app.input.push(c),
+            KeyCode::Up => app.move_selection(-1),
+            KeyCode::Down => app.move_selection(1),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.clear_filter();
+                app.select_first();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.input.push(c);
+                app.recompute_filter();
+                app.select_first();
+            }
             _ => {}
         }
         return;
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit(),
+        KeyCode::Esc => {
+            if app.filter_active() {
+                app.clear_filter();
+                app.select_first();
+            } else if !app.go_back() {
+                app.quit();
+            }
+        }
+        KeyCode::Char('q') => app.quit(),
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Char('d') => app.open_detail().await,
         KeyCode::Char('Q') => app.open_quality(),
         KeyCode::Char('/') | KeyCode::Char('i') => {
-            app.input.clear();
             app.input_mode = true;
         }
         KeyCode::Tab => {
-            let next = match app.view {
-                View::Search => View::Favorites,
-                View::Favorites => View::Queue,
-                View::Queue => View::Search,
-            };
-            app.set_view(next);
+            if app.nav.is_empty() {
+                app.set_tab(app.tab.cycle());
+            }
         }
-        KeyCode::Char('1') => app.set_view(View::Search),
-        KeyCode::Char('2') => app.set_view(View::Favorites),
-        KeyCode::Char('3') => app.set_view(View::Queue),
+        KeyCode::Char('1') => app.set_tab(Tab::Search),
+        KeyCode::Char('2') => app.set_tab(Tab::Library),
+        KeyCode::Char('3') => app.set_tab(Tab::Favorites),
+        KeyCode::Char('4') => app.set_tab(Tab::Queue),
+        KeyCode::Char('t') => {
+            if app.tab == Tab::Search && app.nav.is_empty() {
+                app.search_scope = app.search_scope.cycle();
+                app.recompute_filter();
+                app.select_first();
+            }
+        }
+        KeyCode::Char('S') => {
+            if app.nav.is_empty() {
+                match app.tab {
+                    Tab::Library => {
+                        app.lib_section = app.lib_section.cycle();
+                        app.recompute_filter();
+                        app.select_first();
+                    }
+                    Tab::Favorites => {
+                        app.fav_section = app.fav_section.cycle();
+                        app.recompute_filter();
+                        app.select_first();
+                    }
+                    _ => {}
+                }
+            }
+        }
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
-        KeyCode::Enter => app.play_selected().await,
+        KeyCode::Enter => app.activate().await,
         KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('n') => app.play_next().await,
         KeyCode::Char('p') => app.play_previous().await,
-        KeyCode::Char('+') | KeyCode::Char('=') => app.volume_up(),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.volume_down(),
-        KeyCode::Char('s') => app.stop(),
+        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => app.volume_up(),
+        KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('[') => app.volume_down(),
+        KeyCode::Right => app.seek_by(10.0),
+        KeyCode::Left => app.seek_by(-10.0),
+        KeyCode::Char('s') => app.cycle_shuffle(),
+        KeyCode::Char('r') => app.cycle_repeat(),
+        KeyCode::Char('R') => app.start_radio().await,
+        KeyCode::Char('l') => app.toggle_love().await,
+        KeyCode::Char('a') => app.add_selected().await,
+        KeyCode::Char('A') => app.add_all().await,
+        KeyCode::Char('m') => app.toggle_now_playing_mode(),
+        KeyCode::Char('e') => app.toggle_spectrum(),
+        KeyCode::Char('E') => app.cycle_eq_theme(),
+        KeyCode::Char('x') => app.stop(),
         KeyCode::Char('f') => {
-            app.load_favorites().await;
-            app.set_view(View::Favorites);
+            app.load_library().await;
+            app.set_tab(Tab::Favorites);
         }
         _ => {}
     }

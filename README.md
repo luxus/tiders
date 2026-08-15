@@ -22,28 +22,49 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
 ## Features
 
 - **Interactive TUI** — a fullscreen, themed terminal UI (built with
-  [ratatui](https://ratatui.rs)) with search, favorites, a play queue, and a
-  now‑playing bar. Visual design takes cues from
-  [xai-org/grok-build](https://github.com/xai-org/grok-build).
-- **Inline album art** — cover art rendered right in the terminal via
-  [ratatui-image](https://crates.io/crates/ratatui-image): the native graphics
-  protocol on kitty/sixel/iTerm2, with a **unicode half‑block** fallback that
-  works in any truecolor terminal.
-- **Modals & animation** — a Help overlay, a Track‑Details popup (with cover
-  art), and a Quality selector, all with an open animation; plus a scrolling
-  marquee title, a gradient spectrum, a live progress bar, fade‑out toasts, and
-  loading spinners.
+  [ratatui](https://ratatui.rs)) with search, library, favorites, a play queue,
+  and a now‑playing stage. Visual design and the **120 Hz** frame loop take cues
+  from [xai-org/grok-build](https://github.com/xai-org/grok-build).
+- **Live filter** — `/` fuzzy-filters the current view (library, mixes, playlists,
+  favorites, queue, album tracks) with the SIMD matcher from
+  [FFF](https://github.com/dmtrKovalenko/fff) (`neo_frizbee`). Typo-resistant,
+  ranked as you type, with match highlighting. On the Search tab, **Enter** still
+  queries the TIDAL catalog.
+- **Library** — your playlists, **My Mixes**, and TIDAL **For You** cards, plus
+  album / artist / playlist drill‑down (bio included).
+- **Favorites** — saved tracks, albums, and artists; love / unlove syncs with
+  TIDAL (`l`).
+- **Now‑playing mode** — press `m` for a large cover, synced lyrics, a mini
+  queue, and the spectrum (`Esc` back).
+- **Real FFT spectrum** — [rustfft](https://crates.io/crates/rustfft) analyser
+  with cava‑style gravity, peak hold, and EQ themes (`e` / `E`). Decoded PCM is
+  tapped from a silent mpv `--ao=pcm` sidecar so the bars track the actual
+  stream (with a seeded synth fallback before the tap is ready).
+- **Stream quality** — live decoder details (FLAC / AAC, bit depth, kHz, kbps)
+  from TIDAL’s manifest plus mpv’s `audio-params`.
+- **Shuffle & repeat** — shuffle off / random / favourites / discovery (`s`);
+  repeat off / all / one (`r`). Favourites and discovery are weighted by a
+  local play‑count store.
+- **Queue** — add a track (`a`) or the whole view (`A`) without interrupting
+  playback; the queue persists across restarts. Track radio with `R`.
+- **OS media controls** — **MPRIS** on Linux (`playerctl`, GNOME/KDE applets,
+  Noctalia) and **Now Playing / media keys** on macOS (via a long‑lived mpv
+  plus the platform media session).
+- **Toasts with album art** — fade‑out status toasts carry the current cover.
+- **Inline album art** — cover art rendered via
+  [ratatui-image](https://crates.io/crates/ratatui-image): kitty/sixel/iTerm2,
+  with a unicode half‑block fallback.
+- **Smooth animation** — time‑based easing (not tick-counted frames) for
+  popups, the now‑playing layout, marquee, and toasts. The loop targets **120 Hz**
+  while something is moving (playback, spectrum, toasts) and parks when idle,
+  with terminal synchronized updates so frames don't tear. Input runs on its own
+  OS thread so the UI never blocks on mpv IPC.
 - **Scriptable CLI** — `login`, `search`, `play`, `favorites`, `playlists`,
-  `whoami`, `logout` for pipelines and quick one‑offs.
-- **Secure device‑code login** — the standard TIDAL OAuth device flow; the
-  session token is stored under your platform config dir and refreshed
-  automatically.
-- **Real streaming** — resolves per‑track stream URLs at your chosen quality
-  (Low / High / Lossless / Hi‑Res) and plays them via `mpv`.
-- **Queue + playback controls** — play/pause, next/prev, volume, and automatic
-  advance to the next track.
-- **Cross‑platform** — macOS and Linux (KWin/Noctalia, GNOME, COSMIC, …); no
-  desktop environment required.
+  `whoami`, `logout`.
+- **Secure device‑code login** — OAuth device flow; the session is stored under
+  your platform config dir and refreshed automatically.
+- **Gapless streaming** — a persistent `mpv` (`--idle=yes --gapless-audio=yes`)
+  handles FLAC, DASH, and HLS on both platforms.
 
 ## Architecture
 
@@ -53,13 +74,17 @@ front‑end:
 ```
 crates/
 ├── tiders-core/   # front-end-agnostic engine (library)
-│   ├── config     # where the session + settings live (XDG / ~/Library)
-│   ├── session    # OAuth device login, persistence, catalog access (tidlers)
-│   ├── model      # trimmed view models (tracks, albums, artists, playlists)
-│   ├── queue      # the play queue + cursor
+│   ├── config     # session + settings (XDG / ~/Library)
+│   ├── session    # OAuth device login, catalog, mixes, lyrics
+│   ├── model      # trimmed view models
+│   ├── queue      # play queue, shuffle, repeat
+│   ├── playcount  # local play-count store (weighted shuffle)
+│   ├── lyrics     # LRC parser
+│   ├── spectrum   # rustfft analyser
+│   ├── media      # MPRIS (Linux) / Now Playing (macOS)
 │   ├── player     # playback engine with pluggable AudioBackend
-│   │   ├── mpv    #   → drives an out-of-process mpv over its JSON IPC socket
-│   │   └── null   #   → headless backend for tests / no-audio environments
+│   │   ├── mpv    #   persistent mpv over JSON IPC
+│   │   └── null   #   headless backend for tests
 │   └── format     # shared formatting helpers
 └── tiders/        # the `tiders` binary: clap CLI + ratatui TUI
 ```
@@ -87,16 +112,22 @@ search, browsing) works without it.
 
 ### GitHub Releases
 
-Tagged versions (`vX.Y.Z`) publish Linux and macOS binaries via GitHub Actions.
-Grab the archive for your platform from
-[Releases](https://github.com/luxus/tiders/releases) and unpack the `tiders`
-binary onto your `PATH`.
+Tagged versions (`vX.Y.Z`) publish Linux (`x86_64` and `aarch64`) and macOS
+(`aarch64` and Intel) binaries via GitHub Actions. Grab the archive for your
+platform from [Releases](https://github.com/luxus/tiders/releases) and unpack
+the `tiders` binary onto your `PATH`.
+
+Tiders is **not** published to crates.io because the TIDAL client (`tidlers`)
+is a git dependency.
 
 ```sh
 # after extracting, e.g.
 mkdir -p ~/.local/bin
 install -m 755 tiders ~/.local/bin/tiders
 ```
+
+macOS binaries are unsigned; Gatekeeper may ask you to allow the app on first
+run.
 
 ### Nix
 
@@ -153,7 +184,7 @@ with the `nixpkgs.overlays` module option — `nixosSystem` does not take an
 home-manager is the same idea: `nixpkgs.overlays = [ tiders.overlays.default ];`
 then `home.packages = [ pkgs.tiders ];`.
 
-### Build
+### Build from source
 
 ```sh
 git clone https://github.com/luxus/tiders.git
@@ -184,17 +215,28 @@ library. Keys:
 
 | Key | Action |
 |-----|--------|
-| `/` | search |
-| `Tab` / `1` `2` `3` | switch Search / Favorites / Queue |
+| `/` | live-filter the current list (playlists, mixes, favorites, queue, …). On Search, **Enter** also queries the TIDAL catalog |
+| `Tab` / `1` `2` `3` `4` | Search · Library · Favorites · Queue |
+| `t` | cycle search scope (tracks / albums / artists / playlists) |
+| `S` | cycle Library or Favorites section |
 | `↑`/`↓` or `k`/`j` | move selection |
-| `Enter` | play selected (seeds the queue) |
+| `Enter` | play, or open playlist / mix / album / artist |
+| `Esc` | back / close / leave now-playing mode |
+| `a` / `A` | add track / add all to queue |
 | `Space` | play / pause |
 | `n` / `p` | next / previous |
-| `+` / `-` | volume |
-| `d` | track details (with cover art) |
+| `←` / `→` | seek ±10s |
+| `+` / `-` or `]` / `[` | volume |
+| `s` | cycle shuffle (off · random · favourites · discovery) |
+| `r` | cycle repeat (off · all · one) |
+| `R` | start radio from the focused track |
+| `l` | love / unlove |
+| `m` | now-playing mode (big cover, lyrics, mini queue) |
+| `e` / `E` | toggle spectrum / cycle EQ theme |
+| `d` | track details (cover, BPM, stream quality) |
 | `Q` | change audio quality |
-| `f` | (re)load favorites |
-| `s` | stop |
+| `f` | reload library |
+| `x` | stop |
 | `?` | help |
 | `q` | quit |
 
@@ -219,7 +261,9 @@ Global flags: `--quality low|high|lossless|hires` and `--config-dir <DIR>`
 | File | Purpose |
 |------|---------|
 | `<config>/tiders/session.json` | saved TIDAL session (tokens) |
-| `<config>/tiders/settings.json` | quality, volume, backend |
+| `<config>/tiders/settings.json` | quality, volume, shuffle, repeat, EQ theme |
+| `<config>/tiders/playcounts.json` | local play counts (weighted shuffle) |
+| `<config>/tiders/queue.json` | persisted play queue |
 
 `<config>` is `~/.config` on Linux and `~/Library/Application Support` on macOS,
 overridable with `--config-dir` or the `TIDERS_CONFIG_DIR` environment variable.
@@ -234,21 +278,45 @@ first use. On machines without an audio device (CI, servers), set
 `TIDERS_MPV_AO=null` so `mpv` decodes the stream in real time without opening an
 output.
 
+## CI and releases
+
+GitHub Actions runs on every pull request and every push to `main`:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace` on **Linux and macOS** (unit tests do not need `mpv`)
+
+Releases are automated with [release-plz](https://release-plz.dev) from
+[Conventional Commits](https://www.conventionalcommits.org) (`feat:`, `fix:`, …):
+
+1. Merging to `main` opens a **release PR** that bumps the workspace version and
+   updates [`CHANGELOG.md`](CHANGELOG.md).
+2. Merging that PR tags `vX.Y.Z`.
+3. The existing tag workflow builds Linux/macOS archives and publishes a
+   **GitHub Release** with those binaries.
+
+This does **not** run `cargo publish`. To allow the release PR, enable
+**Allow GitHub Actions to create and approve pull requests** under
+Settings → Actions → General → Workflow permissions.
+
 ## Roadmap
 
 - Hi‑Res DASH assembly (segment stitching) for the `hires` tier.
-- Album/artist/playlist drill‑down and track radio in the TUI.
-- A background **daemon** with an IPC control socket + MPRIS, enabling GUI
-  front‑ends such as a **Noctalia** plugin to drive the same engine.
-- Lyrics and play history (as in Maré Player).
+- A background **daemon** with an IPC control socket, so GUI front‑ends such as
+  a **Noctalia** plugin can drive the same engine (MPRIS is already in-process).
 
 ## Acknowledgements
 
 - [Maré Player](https://github.com/glima/mare-player) — the COSMIC app this ports.
+- [low-tide](https://github.com/pauljhdrake/low-tide) — library, mixes, shuffle,
+  lyrics, and MPRIS behaviour this release draws from.
 - [tidlers](https://codeberg.org/tomkoid/tidlers) — the TIDAL API client.
 - [ratatui](https://ratatui.rs) and [xai-org/grok-build](https://github.com/xai-org/grok-build)
-  — TUI framework and design inspiration.
+  — TUI framework and 120 Hz / animation inspiration.
+- [FFF](https://github.com/dmtrKovalenko/fff) / [neo_frizbee](https://crates.io/crates/neo_frizbee)
+  — SIMD fuzzy matching for in-list filtering.
 - [mpv](https://mpv.io) — the playback engine.
+- [rustfft](https://crates.io/crates/rustfft) — the spectrum analyser.
 
 ## License
 

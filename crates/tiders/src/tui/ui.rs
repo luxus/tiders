@@ -8,13 +8,15 @@ use ratatui::Frame;
 use ratatui_image::{Resize, StatefulImage};
 
 use tiders_core::format;
-use tiders_core::model::TrackView;
+use tiders_core::lyrics;
+use tiders_core::model::{HomeCardKind, TrackView};
+use tiders_core::queue::{RepeatMode, ShuffleMode};
+use tiders_core::spectrum::{self, EqTheme};
 use tiders_core::PlayerStatus;
 
-use super::app::{App, Popup, Screen, View, POPUP_OPEN_FRAMES, QUALITIES};
+use super::app::{App, FavSection, LibSection, Popup, Screen, SearchScope, Tab, QUALITIES};
 use super::theme;
 
-/// Top-level draw entry point.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Block::default().style(Style::default().bg(theme::BG)),
@@ -33,26 +35,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_browse(frame: &mut Frame, app: &mut App) {
+    let np = super::anim::ease_out_cubic(app.np_progress.clamp(0.0, 1.0));
+    // Interpolate the now-playing pane from a compact bar to a fullscreen stage.
+    let compact = 7.0;
+    let stage = (frame.area().height as f32 * 0.72).max(18.0);
+    let np_h = super::anim::lerp(compact, stage, np).round() as u16;
+    let list_min = frame.area().height.saturating_sub(np_h + 3).max(3);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // tabs / search
-            Constraint::Min(3),    // list
-            Constraint::Length(6), // now playing (with art)
-            Constraint::Length(1), // footer
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(list_min),
+            Constraint::Length(np_h),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
     draw_header(frame, app, chunks[0]);
     draw_tabs(frame, app, chunks[1]);
-    draw_list(frame, app, chunks[2]);
-    draw_now_playing(frame, app, chunks[3]);
+    if np > 0.85 {
+        draw_now_playing_stage(frame, app, chunks[2].union(chunks[3]));
+    } else {
+        draw_list(frame, app, chunks[2]);
+        draw_now_playing(frame, app, chunks[3]);
+    }
     draw_footer(frame, app, chunks[4]);
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    // Gradient wordmark.
+fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut left = gradient_spans("≈ Tiders", theme::ACCENT2, theme::ACCENT);
     left.push(Span::styled("  TIDAL in your terminal", theme::dim()));
     if let Some(service) = app.service.as_ref() {
@@ -68,9 +80,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    let q = app.player.quality().clone();
+    let qlabel = if q.sample_rate_hz.is_some() || q.codecs.is_some() {
+        q.label()
+    } else {
+        app.settings.quality.short_label().to_string()
+    };
     let right = format!(
         "{} · vol {}% · img:{}",
-        app.settings.quality.label(),
+        qlabel,
         app.player.volume(),
         app.art.protocol_label()
     );
@@ -79,7 +97,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(right.len() as u16 + 1),
+            Constraint::Length(right.chars().count() as u16 + 1),
         ])
         .split(area);
 
@@ -92,64 +110,103 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     if app.input_mode {
+        let label = if app.tab == Tab::Search && app.nav.is_empty() {
+            "  Search  "
+        } else {
+            "  Filter  "
+        };
+        let hint = if app.tab == Tab::Search && app.nav.is_empty() {
+            "  Enter catalog · ↑↓ move · Esc clear"
+        } else {
+            "  ↑↓ move · Enter open · Esc clear"
+        };
         let line = Line::from(vec![
-            Span::styled(
-                "  Search  ",
-                Style::default().fg(theme::BG).bg(theme::ACCENT),
-            ),
+            Span::styled(label, Style::default().fg(theme::BG).bg(theme::ACCENT)),
             Span::raw(" "),
             Span::styled(&app.input, Style::default().fg(theme::FG)),
             Span::styled(
-                if app.tick % 8 < 4 { "▏" } else { " " },
+                if app.tick % 16 < 8 { "▏" } else { " " },
                 Style::default().fg(theme::ACCENT),
             ),
+            Span::styled(hint, theme::dim()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
 
     let mut spans = Vec::new();
-    for view in [View::Search, View::Favorites, View::Queue] {
-        let selected = app.view == view;
+    for tab in [Tab::Search, Tab::Library, Tab::Favorites, Tab::Queue] {
+        let selected = app.tab == tab && app.nav.is_empty();
         let (fg, modifier) = if selected {
             (theme::ACCENT, Modifier::BOLD)
         } else {
             (theme::DIM, Modifier::empty())
         };
         spans.push(Span::styled(
-            format!("  {}  ", view.title()),
+            format!("  {}  ", tab.title()),
             Style::default().fg(fg).add_modifier(modifier),
         ));
         spans.push(Span::styled("│", Style::default().fg(theme::BORDER)));
     }
-    spans.push(Span::styled(
-        "   / search   d details   Q quality   ? help",
-        theme::dim(),
-    ));
+    if !app.nav.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}  ", app.page_title()),
+            Style::default()
+                .fg(theme::ACCENT2)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.tab == Tab::Library {
+        for sec in [LibSection::Playlists, LibSection::Mixes, LibSection::ForYou] {
+            let on = app.lib_section == sec;
+            spans.push(Span::styled(
+                format!(" {} ", sec.title()),
+                if on {
+                    Style::default().fg(theme::ACCENT2)
+                } else {
+                    theme::dim()
+                },
+            ));
+        }
+    } else if app.tab == Tab::Favorites {
+        for sec in [FavSection::Tracks, FavSection::Albums, FavSection::Artists] {
+            let on = app.fav_section == sec;
+            spans.push(Span::styled(
+                format!(" {} ", sec.title()),
+                if on {
+                    Style::default().fg(theme::ACCENT2)
+                } else {
+                    theme::dim()
+                },
+            ));
+        }
+    } else if app.tab == Tab::Search {
+        spans.push(Span::styled(
+            format!(" [{}] ", app.search_scope.title()),
+            Style::default().fg(theme::ACCENT2),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let tracks = app.current_tracks();
-    let spin = if app.loading {
-        format!(" {} ", spinner(app.tick))
+    let title = if app.filter_active() {
+        format!(
+            " {} ({}/{}) ",
+            app.page_title(),
+            app.current_len(),
+            app.unfiltered_len()
+        )
     } else {
-        String::new()
+        format!(" {} ({}) ", app.page_title(), app.current_len())
     };
-    let title = format!(" {} ({}){}", app.view.title(), tracks.len(), spin);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border_focused())
         .title(Span::styled(title, theme::accent()));
 
-    if tracks.is_empty() {
-        let hint = match app.view {
-            View::Search => "No results yet — press / and type an artist, track, or album.",
-            View::Favorites => "No favorites loaded — press f to (re)load your favorites.",
-            View::Queue => "The queue is empty — pick a track and press Enter to play.",
-        };
+    if app.current_len() == 0 {
+        let hint = empty_hint(app);
         frame.render_widget(
             Paragraph::new(hint)
                 .style(theme::dim())
@@ -161,20 +218,165 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let width = area.width.saturating_sub(4) as usize;
-    let now_playing_id = app.player.now_playing().map(|t| t.id);
-    let items: Vec<ListItem> = tracks
-        .iter()
-        .enumerate()
-        .map(|(i, t)| track_row(i, t, width, now_playing_id == Some(t.id)))
-        .collect();
+    if app.showing_tracks() || !app.nav.is_empty() {
+        let tracks = app.current_tracks();
+        let width = area.width.saturating_sub(4) as usize;
+        let now_playing_id = app.player.now_playing().map(|t| t.id);
+        let items: Vec<ListItem> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let hit = app.hit_at(i);
+                track_row(i, t, width, now_playing_id == Some(t.id), hit)
+            })
+            .collect();
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(theme::selected())
+            .highlight_symbol("▍ ");
+        frame.render_stateful_widget(list, area, &mut app.list_state);
+        return;
+    }
 
+    let items = collection_rows(app);
     let list = List::new(items)
         .block(block)
         .highlight_style(theme::selected())
         .highlight_symbol("▍ ");
-
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+fn empty_hint(app: &App) -> String {
+    if app.filter_active() {
+        return format!("No matches for “{}”.", app.input.trim());
+    }
+    if !app.nav.is_empty() {
+        return "Nothing in this collection.".into();
+    }
+    match app.tab {
+        Tab::Search => "No results yet — press / to filter, Enter to search the catalog.".into(),
+        Tab::Library => {
+            "Library is empty — playlists, mixes and For You load after sign-in.".into()
+        }
+        Tab::Favorites => "No favorites loaded — press f to reload.".into(),
+        Tab::Queue => "The queue is empty — pick a track and press Enter to play.".into(),
+    }
+}
+
+fn collection_rows(app: &App) -> Vec<ListItem<'static>> {
+    match app.tab {
+        Tab::Search => match app.search_scope {
+            SearchScope::Albums => map_visible(&app.results.albums, app, |a, hit| {
+                row(
+                    &a.title,
+                    &a.artist,
+                    "album",
+                    hit_title_indices(a.title.len(), hit),
+                )
+            }),
+            SearchScope::Artists => map_visible(&app.results.artists, app, |a, hit| {
+                row(&a.name, "artist", "", hit_indices(hit))
+            }),
+            SearchScope::Playlists => map_visible(&app.results.playlists, app, |p, hit| {
+                row(
+                    &p.title,
+                    &format!("{} tracks", p.tracks),
+                    "playlist",
+                    hit_title_indices(p.title.len(), hit),
+                )
+            }),
+            SearchScope::Tracks => Vec::new(),
+        },
+        Tab::Library => match app.lib_section {
+            LibSection::Playlists => map_visible(&app.playlists, app, |p, hit| {
+                row(
+                    &p.title,
+                    &format!("{} tracks", p.tracks),
+                    "playlist",
+                    hit_title_indices(p.title.len(), hit),
+                )
+            }),
+            LibSection::Mixes => map_visible(&app.mixes, app, |m, hit| {
+                row(
+                    &m.title,
+                    &m.subtitle,
+                    "mix",
+                    hit_title_indices(m.title.len(), hit),
+                )
+            }),
+            LibSection::ForYou => map_visible(&app.for_you, app, |c, hit| {
+                let kind = match c.kind {
+                    HomeCardKind::Mix { .. } => "mix",
+                    HomeCardKind::Playlist { .. } => "playlist",
+                    HomeCardKind::Album { .. } => "album",
+                    HomeCardKind::Artist { .. } => "artist",
+                };
+                row(
+                    &c.title,
+                    &c.subtitle,
+                    kind,
+                    hit_title_indices(c.title.len(), hit),
+                )
+            }),
+        },
+        Tab::Favorites => match app.fav_section {
+            FavSection::Albums => map_visible(&app.fav_albums, app, |a, hit| {
+                row(
+                    &a.title,
+                    a.artist.as_str(),
+                    "album",
+                    hit_title_indices(a.title.len(), hit),
+                )
+            }),
+            FavSection::Artists => map_visible(&app.fav_artists, app, |a, hit| {
+                row(&a.name, "artist", "", hit_indices(hit))
+            }),
+            FavSection::Tracks => Vec::new(),
+        },
+        Tab::Queue => Vec::new(),
+    }
+}
+
+fn map_visible<'a, T>(
+    items: &'a [T],
+    app: &'a App,
+    mut f: impl FnMut(&'a T, Option<&'a super::filter::Hit>) -> ListItem<'static>,
+) -> Vec<ListItem<'static>> {
+    (0..app.current_len())
+        .filter_map(|i| items.get(app.orig_at(i)).map(|item| f(item, app.hit_at(i))))
+        .collect()
+}
+
+fn hit_indices(hit: Option<&super::filter::Hit>) -> Vec<usize> {
+    hit.map(|h| h.indices.clone()).unwrap_or_default()
+}
+
+fn hit_title_indices(title_len: usize, hit: Option<&super::filter::Hit>) -> Vec<usize> {
+    let Some(hit) = hit else {
+        return Vec::new();
+    };
+    super::filter::split_highlights(title_len, 1, &hit.indices).0
+}
+
+fn row(title: &str, subtitle: &str, kind: &str, title_hits: Vec<usize>) -> ListItem<'static> {
+    let hit_style = Style::default()
+        .fg(theme::ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let base = Style::default().fg(theme::FG);
+    let mut spans = vec![Span::styled(
+        format!("{kind:<8} "),
+        Style::default().fg(theme::ACCENT2),
+    )];
+    spans.extend(super::filter::highlight(
+        title,
+        &title_hits,
+        base,
+        hit_style,
+    ));
+    if !subtitle.is_empty() {
+        spans.push(Span::styled(format!("  {subtitle}"), theme::dim()));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn track_row<'a>(
@@ -182,51 +384,73 @@ fn track_row<'a>(
     track: &'a TrackView,
     width: usize,
     is_current: bool,
+    hit: Option<&super::filter::Hit>,
 ) -> ListItem<'a> {
     let dur = track.duration();
-    let text_budget = width.saturating_sub(4 + 7 + 3 + 2).max(8);
+    let text_budget = width.saturating_sub(4 + 7 + 8 + 2).max(8);
     let title_budget = (text_budget * 3) / 5;
     let artist_budget = text_budget.saturating_sub(title_budget);
-
     let marker = if is_current { "♪ " } else { "  " };
     let title = format::truncate(&track.title, title_budget);
     let artist = format::truncate(&track.artist, artist_budget.max(4));
-
+    let (title_hits, artist_hits) = match hit {
+        Some(h) => super::filter::split_highlights(track.title.len(), 1, &h.indices),
+        None => (Vec::new(), Vec::new()),
+    };
+    let title_style = if is_current {
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::FG)
+    };
+    let hit_style = Style::default()
+        .fg(theme::ACCENT)
+        .add_modifier(Modifier::BOLD);
     let mut spans = vec![
         Span::styled(marker, Style::default().fg(theme::GREEN)),
         Span::styled(format!("{:>2}. ", index + 1), theme::dim()),
-        Span::styled(
-            title,
-            if is_current {
-                Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::FG)
-            },
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(artist, theme::dim()),
     ];
+    spans.extend(super::filter::highlight(
+        &title,
+        &title_hits,
+        title_style,
+        hit_style,
+    ));
+    spans.push(Span::styled("  ", Style::default()));
+    spans.extend(super::filter::highlight(
+        &artist,
+        &artist_hits,
+        theme::dim(),
+        hit_style,
+    ));
+    if let Some(badge) = track.quality_badge() {
+        spans.push(Span::styled(
+            format!(" {badge}"),
+            Style::default().fg(theme::ACCENT2),
+        ));
+    }
     if track.explicit {
         spans.push(Span::styled("  E", Style::default().fg(theme::MAGENTA)));
     }
     spans.push(Span::styled(format!("   {dur:>5}"), theme::dim()));
-
     ListItem::new(Line::from(spans))
 }
 
 fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Gather everything we need before mutably borrowing the art protocol.
     let status = app.player.status();
     let np = app.player.now_playing().cloned();
     let volume = app.player.volume();
     let snap = app.player.snapshot();
-    let backend = app.player.backend_name().to_string();
     let elapsed = app.elapsed_secs();
     let progress = app.progress();
     let tick = app.tick;
     let has_art = app.now_art.is_some();
+    let shuffle = app.player.shuffle();
+    let repeat = app.player.repeat();
+    let qlabel = app.player.quality().label();
+    let show_spec = app.settings.show_spectrum;
+    let theme_eq = app.settings.eq_theme;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -236,8 +460,11 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split off a square-ish album-art column on the left when we have art.
-    let art_w = if has_art { inner.height * 2 } else { 0 };
+    let art_w = if has_art {
+        inner.height.saturating_mul(2).min(inner.width / 3)
+    } else {
+        0
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(art_w), Constraint::Min(10)])
@@ -245,13 +472,18 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     let art_area = cols[0];
     let info_area = cols[1];
 
+    let spec_h = if show_spec {
+        (info_area.height / 2).clamp(1, 4)
+    } else {
+        0
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(1), // spectrum
-            Constraint::Length(1), // progress
-            Constraint::Length(1), // meta
+            Constraint::Length(1),
+            Constraint::Length(spec_h),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
         .split(info_area);
 
@@ -279,13 +511,12 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
                 ])),
                 rows[0],
             );
-            frame.render_widget(
-                Paragraph::new(spectrum_line(tick, status == PlayerStatus::Playing, 24)),
-                rows[1],
-            );
 
-            // Progress bar with elapsed / total.
-            let total = track.duration_secs;
+            if spec_h > 0 {
+                draw_spectrum(frame, app, rows[1], theme_eq);
+            }
+
+            let total = track.duration_secs as f64;
             let bar_cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -295,7 +526,7 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
                 ])
                 .split(rows[2]);
             frame.render_widget(
-                Paragraph::new(Span::styled(format::duration(elapsed), theme::dim())),
+                Paragraph::new(Span::styled(format::duration(elapsed as u64), theme::dim())),
                 bar_cols[0],
             );
             frame.render_widget(
@@ -306,9 +537,42 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
                 bar_cols[1],
             );
             frame.render_widget(
-                Paragraph::new(Span::styled(format::duration(total), theme::dim()))
+                Paragraph::new(Span::styled(format::duration(total as u64), theme::dim()))
                     .alignment(Alignment::Right),
                 bar_cols[2],
+            );
+
+            let pos = match snap.queue_position {
+                Some(i) if snap.queue_len > 0 => format!("{}/{}", i + 1, snap.queue_len),
+                _ => "0/0".into(),
+            };
+            let sh_style = if shuffle == ShuffleMode::Off {
+                theme::dim()
+            } else {
+                Style::default().fg(theme::ACCENT)
+            };
+            let rp_style = if repeat == RepeatMode::Off {
+                theme::dim()
+            } else {
+                Style::default().fg(theme::ACCENT)
+            };
+            let lyric = current_lyric(app, elapsed);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {} {}  ", shuffle.icon(), shuffle.label()),
+                        sh_style,
+                    ),
+                    Span::styled(format!("{} {}  ", repeat.icon(), repeat.label()), rp_style),
+                    Span::styled(format!("vol {volume}%  "), theme::dim()),
+                    Span::styled(format!("{pos}  "), Style::default().fg(theme::FG)),
+                    Span::styled(qlabel, Style::default().fg(theme::ACCENT2)),
+                    Span::styled(
+                        lyric.map(|s| format!("  ·  {s}")).unwrap_or_default(),
+                        theme::dim(),
+                    ),
+                ])),
+                rows[3],
             );
         }
         None => {
@@ -322,36 +586,6 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // Meta row: volume gauge + queue + backend.
-    let pos = match snap.queue_position {
-        Some(i) if snap.queue_len > 0 => format!("{}/{}", i + 1, snap.queue_len),
-        _ => "0/0".to_string(),
-    };
-    let meta = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Min(10)])
-        .split(rows[3]);
-    frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(theme::ACCENT2).bg(theme::SURFACE))
-            .ratio((volume as f64 / 100.0).clamp(0.0, 1.0))
-            .label(Span::styled(
-                format!("vol {volume}%"),
-                Style::default().fg(theme::BG).add_modifier(Modifier::BOLD),
-            )),
-        meta[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("  queue ", theme::dim()),
-            Span::styled(pos, Style::default().fg(theme::FG)),
-            Span::styled("   backend ", theme::dim()),
-            Span::styled(backend, Style::default().fg(theme::ACCENT2)),
-        ])),
-        meta[1],
-    );
-
-    // Finally, the album art (mutably borrows the protocol).
     if art_area.width > 0 {
         if let Some(art) = app.now_art.as_mut() {
             frame.render_stateful_widget(
@@ -363,22 +597,257 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn draw_now_playing_stage(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border_focused())
+        .title(Span::styled(" Now Playing ", theme::accent()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(38),
+            Constraint::Percentage(37),
+            Constraint::Percentage(25),
+        ])
+        .split(inner);
+
+    // Cover + spectrum
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(6)])
+        .split(cols[0]);
+    if let Some(art) = app.now_art.as_mut() {
+        frame.render_stateful_widget(
+            StatefulImage::default().resize(Resize::Fit(None)),
+            left[0],
+            art,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("♪")
+                .alignment(Alignment::Center)
+                .style(theme::dim()),
+            left[0],
+        );
+    }
+    if app.settings.show_spectrum {
+        draw_spectrum(frame, app, left[1], app.settings.eq_theme);
+    }
+
+    // Track info + lyrics
+    let track = app.player.now_playing().cloned();
+    let elapsed = app.elapsed_secs();
+    let progress = app.progress();
+    let status = app.player.status();
+    let qlabel = app.player.quality().label();
+    let mid = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
+        .split(inset(cols[1], 1, 0));
+
+    if let Some(track) = &track {
+        let (icon, _) = match status {
+            PlayerStatus::Playing => ("▶", theme::GREEN),
+            PlayerStatus::Paused => ("⏸", theme::YELLOW),
+            PlayerStatus::Stopped => ("⏹", theme::DIM),
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("{icon}  {}", track.title),
+                    Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{}  ·  {}",
+                        track.artist,
+                        track.album.clone().unwrap_or_default()
+                    ),
+                    Style::default().fg(theme::ACCENT2),
+                )),
+                Line::from(Span::styled(qlabel, theme::dim())),
+            ]),
+            mid[0],
+        );
+        frame.render_widget(
+            Gauge::default()
+                .gauge_style(Style::default().fg(theme::ACCENT).bg(theme::SURFACE))
+                .ratio(progress)
+                .label(format!(
+                    "{} / {}",
+                    format::duration(elapsed as u64),
+                    format::duration(track.duration_secs)
+                )),
+            mid[1],
+        );
+        draw_lyrics(frame, app, elapsed, mid[2]);
+    } else {
+        frame.render_widget(
+            Paragraph::new("Nothing playing").style(theme::dim()),
+            mid[0],
+        );
+    }
+
+    // Mini queue
+    let qblock = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(theme::border())
+        .title(Span::styled(" Queue ", theme::dim()));
+    let qinner = qblock.inner(cols[2]);
+    frame.render_widget(qblock, cols[2]);
+    let items: Vec<ListItem> = app
+        .player
+        .queue()
+        .items()
+        .iter()
+        .enumerate()
+        .take(qinner.height as usize)
+        .map(|(i, t)| {
+            let cur = app.player.queue().cursor() == Some(i);
+            ListItem::new(Span::styled(
+                format::truncate(&format!("{}. {}", i + 1, t.title), qinner.width as usize),
+                if cur {
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    theme::dim()
+                },
+            ))
+        })
+        .collect();
+    frame.render_widget(List::new(items), qinner);
+}
+
+fn draw_lyrics(frame: &mut Frame, app: &App, elapsed: f64, area: Rect) {
+    if app.lyrics.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No synced lyrics for this track.")
+                .style(theme::dim())
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+    let idx = lyrics::current_line_index(&app.lyrics, elapsed).unwrap_or(0);
+    let start = idx.saturating_sub(area.height as usize / 2);
+    let mut lines = Vec::new();
+    for (i, line) in app.lyrics.iter().enumerate().skip(start) {
+        if lines.len() >= area.height as usize {
+            break;
+        }
+        let style = if i == idx {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else if i + 1 == idx || i == idx + 1 {
+            Style::default().fg(theme::FG)
+        } else {
+            theme::dim()
+        };
+        lines.push(Line::from(Span::styled(line.text.clone(), style)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_spectrum(frame: &mut Frame, app: &mut App, area: Rect, eq: EqTheme) {
+    if area.height == 0 || area.width < 8 {
+        return;
+    }
+    app.spectrum.set_bars(area.width as usize);
+    let frame_spec = app.spectrum.frame();
+    let rows = spectrum::render_rows(&frame_spec, area.height);
+    let stops = eq.stops();
+    let mut lines = Vec::new();
+    for row in rows {
+        let spans: Vec<Span> = row
+            .into_iter()
+            .map(|(ch, t)| {
+                let color = gradient_stop(stops, t);
+                Span::styled(ch.to_string(), Style::default().fg(color))
+            })
+            .collect();
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn gradient_stop(stops: [(u8, u8, u8); 4], t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let seg = t * (stops.len() - 1) as f32;
+    let lo = (seg.floor() as usize).min(stops.len() - 2);
+    let frac = seg - lo as f32;
+    let (ar, ag, ab) = stops[lo];
+    let (br, bg, bb) = stops[lo + 1];
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * frac).round() as u8;
+    Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+}
+
+fn current_lyric(app: &App, elapsed: f64) -> Option<String> {
+    let idx = lyrics::current_line_index(&app.lyrics, elapsed)?;
+    Some(app.lyrics.get(idx)?.text.clone())
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = if app.input_mode {
-        &[("Enter", "search"), ("Esc", "cancel")]
-    } else {
+        if app.tab == Tab::Search && app.nav.is_empty() {
+            &[
+                ("Enter", "catalog"),
+                ("↑↓", "move"),
+                ("Esc", "clear"),
+                ("C-u", "reset"),
+            ]
+        } else {
+            &[
+                ("Enter", "open"),
+                ("↑↓", "move"),
+                ("Esc", "clear"),
+                ("C-u", "reset"),
+            ]
+        }
+    } else if app.filter_active() {
         &[
-            ("/", "search"),
-            ("↵", "play"),
+            ("Esc", "clear filter"),
+            ("/", "edit"),
+            ("Enter", "open"),
+            ("j/k", "move"),
+        ]
+    } else if app.now_playing_mode {
+        &[
+            ("Esc", "back"),
             ("Spc", "pause"),
             ("n/p", "next/prev"),
-            ("d", "details"),
-            ("Q", "quality"),
+            ("s", "shuffle"),
+            ("r", "repeat"),
+            ("e", "eq"),
+            ("q", "quit"),
+        ]
+    } else {
+        &[
+            ("/", "filter"),
+            ("↵", "play"),
+            ("Spc", "pause"),
+            ("s", "shuffle"),
+            ("r", "repeat"),
+            ("m", "now playing"),
             ("?", "help"),
             ("q", "quit"),
         ]
     };
-
     let mut spans = Vec::new();
     for (key, label) in hints {
         spans.push(Span::styled(
@@ -390,24 +859,19 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-// ── popups ──────────────────────────────────────────────────────────────
-
 fn draw_popup(frame: &mut Frame, app: &mut App) {
-    let factor = (app.popup_anim as f32 / POPUP_OPEN_FRAMES as f32).clamp(0.2, 1.0);
+    let factor = app.popup_factor().clamp(0.15, 1.0);
     let (base_w, base_h) = match app.popup {
-        Some(Popup::Help) => (56u16, 74u16),
+        Some(Popup::Help) => (62u16, 82u16),
         Some(Popup::Detail(_)) => (70, 78),
-        Some(Popup::Quality) => (38, 48),
+        Some(Popup::Quality) => (52, 56),
         None => return,
     };
     let pct_w = ((base_w as f32) * factor) as u16;
     let pct_h = ((base_h as f32) * factor) as u16;
     let area = centered_pct(pct_w.max(18), pct_h.max(18), frame.area());
-
     frame.render_widget(Clear, area);
 
-    // Extract the popup kind (owning any needed data) so the app can be mutably
-    // borrowed again below for image rendering.
     enum Kind {
         Help,
         Quality,
@@ -416,7 +880,7 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
     let kind = match &app.popup {
         Some(Popup::Help) => Kind::Help,
         Some(Popup::Quality) => Kind::Quality,
-        Some(Popup::Detail(track)) => Kind::Detail(Box::new(track.clone())),
+        Some(Popup::Detail(track)) => Kind::Detail(track.clone()),
         None => return,
     };
     let title = match &kind {
@@ -424,7 +888,6 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         Kind::Detail(_) => " Track Details ",
         Kind::Quality => " Audio Quality ",
     };
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -433,12 +896,9 @@ fn draw_popup(frame: &mut Frame, app: &mut App) {
         .title(Span::styled(title, theme::accent()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    // While the box is still expanding, show just the frame (nice "open" feel).
-    if factor < 0.85 {
+    if factor < 0.88 {
         return;
     }
-
     match kind {
         Kind::Help => draw_help(frame, inner),
         Kind::Quality => draw_quality(frame, app.quality_cursor, inner),
@@ -455,29 +915,32 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     };
     let desc = |d: &str| Span::styled(format!("  {d}"), theme::base());
     let rows = [
-        ("/", "search the catalog"),
-        ("Tab / 1 2 3", "switch Search · Favorites · Queue"),
-        ("↑ ↓ / k j", "move selection"),
-        ("Enter", "play the highlighted track"),
+        (
+            "/",
+            "filter the current list (FFF) — Enter searches the catalog",
+        ),
+        ("Tab / 1–4", "Search · Library · Favorites · Queue"),
+        ("t / S", "cycle search scope / library-favorites section"),
+        ("Enter", "play or open the highlighted item"),
+        ("a / A", "add track / add all to queue"),
         ("Space", "play / pause"),
-        ("n / p", "next / previous track"),
-        ("+ / -", "volume up / down"),
-        ("s", "stop"),
-        ("d", "track details (with cover art)"),
-        ("Q", "change audio quality"),
-        ("f", "reload favorites"),
-        ("? / Esc", "toggle this help / close"),
+        ("n / p", "next / previous"),
+        ("← →", "seek ±10s"),
+        ("s / r", "shuffle / repeat (off · all · one)"),
+        ("R", "start radio from the focused track"),
+        ("l", "love / unlove"),
+        ("m", "now-playing mode (big cover, lyrics, mini queue)"),
+        ("e / E", "toggle spectrum / cycle EQ theme"),
+        ("d", "track details"),
+        ("Q", "streaming quality"),
+        ("x", "stop"),
+        ("Esc", "back / close"),
         ("q", "quit"),
     ];
     let mut lines = vec![Line::from("")];
     for (k, d) in rows {
         lines.push(Line::from(vec![key(k), desc(d)]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Tiders — TIDAL in your terminal",
-        theme::dim(),
-    )));
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }),
         inset(area, 2, 1),
@@ -516,10 +979,8 @@ fn draw_quality(frame: &mut Frame, cursor: usize, area: Rect) {
 fn draw_detail(frame: &mut Frame, app: &mut App, track: &TrackView, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(inset(area, 1, 1));
-
-    // Metadata on the right.
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -534,32 +995,38 @@ fn draw_detail(frame: &mut Frame, app: &mut App, track: &TrackView, area: Rect) 
     ];
     if let Some(album) = &track.album {
         lines.push(Line::from(vec![
-            Span::styled("Album   ", theme::dim()),
+            Span::styled("Album     ", theme::dim()),
             Span::styled(album.clone(), theme::base()),
         ]));
     }
     lines.push(Line::from(vec![
-        Span::styled("Length  ", theme::dim()),
+        Span::styled("Length    ", theme::dim()),
         Span::styled(track.duration(), theme::base()),
     ]));
+    if let Some(q) = track.audio_quality.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("Quality   ", theme::dim()),
+            Span::styled(q.clone(), theme::base()),
+        ]));
+    }
+    let live = app.player.quality().label();
     lines.push(Line::from(vec![
-        Span::styled("Track   ", theme::dim()),
-        Span::styled(format!("#{}", track.id), theme::base()),
+        Span::styled("Stream    ", theme::dim()),
+        Span::styled(live, Style::default().fg(theme::ACCENT2)),
     ]));
+    if let Some(bpm) = track.bpm {
+        lines.push(Line::from(vec![
+            Span::styled("BPM       ", theme::dim()),
+            Span::styled(format!("{bpm:.0}"), theme::base()),
+        ]));
+    }
     if track.explicit {
         lines.push(Line::from(Span::styled(
             "Explicit",
             Style::default().fg(theme::MAGENTA),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Enter / Esc to close · Enter on the list to play",
-        theme::dim(),
-    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), cols[1]);
-
-    // Cover art on the left.
     if let Some(art) = app.detail_art.as_mut() {
         frame.render_stateful_widget(
             StatefulImage::default().resize(Resize::Fit(None)),
@@ -576,26 +1043,30 @@ fn draw_detail(frame: &mut Frame, app: &mut App, track: &TrackView, area: Rect) 
     }
 }
 
-// ── toast ───────────────────────────────────────────────────────────────
-
-fn draw_toast(frame: &mut Frame, app: &App) {
+fn draw_toast(frame: &mut Frame, app: &mut App) {
     let Some(alpha) = app.toast_alpha() else {
-        return;
-    };
-    let Some(msg) = app.toast.as_ref() else {
         return;
     };
     if app.popup.is_some() || app.screen != Screen::Browse {
         return;
     }
-    let text = format::truncate(msg, 44);
-    let w = (text.chars().count() as u16) + 4;
+    let Some(toast) = app.toast.as_ref() else {
+        return;
+    };
+    let text = format::truncate(&toast.message, 42);
+    let has_art = toast.art.is_some();
+    let w = (text.chars().count() as u16) + 4 + if has_art { 8 } else { 0 };
+    let h = if has_art { 5 } else { 3 };
     let full = frame.area();
-    if full.width < w + 2 || full.height < 5 {
+    if full.width < w + 2 || full.height < h + 2 {
         return;
     }
-    // Bottom-right, just above the footer.
-    let area = Rect::new(full.width - w - 1, full.height.saturating_sub(4), w, 3);
+    let area = Rect::new(
+        full.width.saturating_sub(w + 1),
+        full.height.saturating_sub(h + 1),
+        w,
+        h,
+    );
     let fg = theme::blend(theme::YELLOW, theme::SURFACE, 1.0 - alpha);
     let border = theme::blend(theme::ACCENT, theme::SURFACE, 1.0 - alpha);
     frame.render_widget(Clear, area);
@@ -604,15 +1075,32 @@ fn draw_toast(frame: &mut Frame, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(theme::SURFACE));
-    frame.render_widget(
-        Paragraph::new(Span::styled(text, Style::default().fg(fg)))
-            .block(block)
-            .alignment(Alignment::Center),
-        area,
-    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if has_art {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(6), Constraint::Min(6)])
+            .split(inner);
+        if let Some(art) = app.toast.as_mut().and_then(|t| t.art.as_mut()) {
+            frame.render_stateful_widget(
+                StatefulImage::default().resize(Resize::Fit(None)),
+                cols[0],
+                art,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(fg))).alignment(Alignment::Left),
+            cols[1],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(fg)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+    }
 }
-
-// ── login screen ─────────────────────────────────────────────────────────
 
 fn draw_login(frame: &mut Frame, app: &App) {
     let outer = Layout::default()
@@ -705,39 +1193,11 @@ fn draw_login(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(footer), outer[2]);
 }
 
-// ── small helpers ─────────────────────────────────────────────────────────
-
 fn spinner(tick: u64) -> String {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    FRAMES[(tick as usize / 2) % FRAMES.len()].to_string()
+    FRAMES[(tick as usize / 4) % FRAMES.len()].to_string()
 }
 
-/// An animated frequency-bar "spectrum" with a teal→green gradient.
-fn spectrum_line(tick: u64, animate: bool, bars: usize) -> Line<'static> {
-    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let mut spans = Vec::with_capacity(bars);
-    for i in 0..bars {
-        let h = if animate {
-            let phase = (tick as usize + i * 2) % 14;
-            if phase < 8 {
-                phase
-            } else {
-                14 - phase
-            }
-        } else {
-            0
-        };
-        let h = h.min(7);
-        let color = theme::blend(theme::ACCENT, theme::GREEN, h as f32 / 7.0);
-        spans.push(Span::styled(
-            GLYPHS[h].to_string(),
-            Style::default().fg(color),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// Horizontal marquee: scrolls `text` within `width` while playing.
 fn marquee(text: &str, width: usize, tick: u64, animate: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     if width == 0 {
@@ -751,7 +1211,7 @@ fn marquee(text: &str, width: usize, tick: u64, animate: bool) -> String {
     }
     let sep = "   •   ";
     let loop_str: Vec<char> = text.chars().chain(sep.chars()).collect();
-    let offset = (tick as usize / 3) % loop_str.len();
+    let offset = ((tick as usize) / 6) % loop_str.len();
     let mut out = String::with_capacity(width);
     for k in 0..width {
         out.push(loop_str[(offset + k) % loop_str.len()]);
@@ -759,7 +1219,6 @@ fn marquee(text: &str, width: usize, tick: u64, animate: bool) -> String {
     out
 }
 
-/// A left-to-right two-color gradient over the characters of `text`.
 fn gradient_spans(text: &str, from: Color, to: Color) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1);
@@ -778,7 +1237,6 @@ fn gradient_spans(text: &str, from: Color, to: Color) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Shrink a rect by `(dx, dy)` on each side.
 fn inset(area: Rect, dx: u16, dy: u16) -> Rect {
     Rect {
         x: area.x + dx,
@@ -788,7 +1246,6 @@ fn inset(area: Rect, dx: u16, dy: u16) -> Rect {
     }
 }
 
-/// Compute a centered rectangle sized `w`×`h` cells within `area`.
 fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
@@ -797,7 +1254,6 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-/// Compute a centered rectangle sized `pct_w`% × `pct_h`% of `area`.
 fn centered_pct(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
     let w = area.width * pct_w.min(100) / 100;
     let h = area.height * pct_h.min(100) / 100;

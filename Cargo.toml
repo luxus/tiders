@@ -9,6 +9,8 @@ license = "MIT"
 repository = "https://github.com/luxus/tiders"
 authors = ["Tiders authors"]
 rust-version = "1.85"
+# Not on crates.io: `tidlers` is a git dependency.
+publish = false
 
 [workspace.dependencies]
 tiders-core = { path = "crates/tiders-core" }
@@ -24,6 +26,10 @@ thiserror = "2"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+rustfft = "6"
+# SIMD fuzzy matcher used by FFF (https://github.com/dmtrKovalenko/fff).
+neo_frizbee = "0.11"
 
 [profile.release]
 strip = true

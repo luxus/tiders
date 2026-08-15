@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 tidlers.workspace = true
@@ -16,8 +17,20 @@ serde_json.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
 tracing.workspace = true
+rand.workspace = true
+rustfft.workspace = true
 # Public cover-art fetches from resources.tidal.com (no auth needed).
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# OS media controls: MPRIS on Linux (pure-Rust zbus), Now Playing on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+souvlaki = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

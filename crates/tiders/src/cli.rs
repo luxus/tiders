@@ -207,9 +207,10 @@ async fn play(config: Config, settings: Settings, quality: Quality, track_id: u6
         quality.label(),
         player.backend_name()
     );
-    if let Some(codecs) = &stream.codecs {
+    if let Some(codecs) = &stream.quality.codecs {
         println!("     codec: {codecs}");
     }
+    println!("     {}", stream.quality.label());
 
     if player.backend_name() == "null" {
         println!(

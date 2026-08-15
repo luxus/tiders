@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 default-run = "tiders"
 
 [[bin]]
@@ -31,3 +32,4 @@ open = "5"
 # default-features off drops the heavy AV1/AVIF codecs; TIDAL cover art is JPEG.
 ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+neo_frizbee.workspace = true

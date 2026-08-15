@@ -1,0 +1,27 @@
+# GitHub Releases + changelog only. crates.io publish is disabled because
+# `tidlers` is a git dependency (Cargo.toml `publish = false`).
+[workspace]
+git_only = true
+publish = false
+semver_check = false
+# Only tag/release when the release-plz PR is merged, not on every main commit.
+release_always = false
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
+name = "tiders"
+changelog_path = "CHANGELOG.md"
+changelog_include = ["tiders-core"]
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+# GitHub Release + binaries are created by `.github/workflows/release.yml`.
+git_release_enable = false
+version_group = "tiders"
+
+[[package]]
+name = "tiders-core"
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+version_group = "tiders"

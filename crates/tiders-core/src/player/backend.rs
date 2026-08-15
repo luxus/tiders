@@ -6,6 +6,7 @@
 //! decoder, or the headless [`NullBackend`] used by tests.
 
 use crate::error::Result;
+use crate::model::StreamQuality;
 
 /// Something that can play a single audio stream URL at a time.
 ///
@@ -35,6 +36,47 @@ pub trait AudioBackend: Send {
 
     /// Human-readable backend name, e.g. `"mpv"` or `"null"`.
     fn name(&self) -> &'static str;
+
+    /// Seek to an absolute position in seconds.
+    fn seek(&mut self, seconds: f64) -> Result<()> {
+        let _ = seconds;
+        Ok(())
+    }
+
+    /// Current playback position in seconds, if known.
+    fn position(&mut self) -> Option<f64> {
+        None
+    }
+
+    /// Decoded duration in seconds, if known.
+    fn duration(&mut self) -> Option<f64> {
+        None
+    }
+
+    /// Decoder-reported stream format (sample rate, bit depth, codec, …).
+    fn stream_quality(&mut self) -> StreamQuality {
+        StreamQuality::default()
+    }
+
+    /// Title shown in the OS Now Playing / mpv media-title.
+    fn set_media_title(&mut self, title: &str) -> Result<()> {
+        let _ = title;
+        Ok(())
+    }
+
+    /// Loop the current file (repeat-one).
+    fn set_loop_file(&mut self, on: bool) -> Result<()> {
+        let _ = on;
+        Ok(())
+    }
+
+    /// Append recently decoded PCM samples (mono `f32`, ~44.1 kHz) into `dst`.
+    ///
+    /// Default is a no-op. The mpv backend drains a FIFO tap filled by a silent
+    /// `--ao=pcm` sidecar so the rustfft analyser sees real audio.
+    fn drain_pcm(&mut self, dst: &mut Vec<f32>) {
+        dst.clear();
+    }
 }
 
 /// A backend that tracks state but produces no sound.
@@ -47,6 +89,7 @@ pub struct NullBackend {
     paused: bool,
     volume: u8,
     last_url: Option<String>,
+    position: f64,
 }
 
 impl NullBackend {
@@ -76,6 +119,7 @@ impl AudioBackend for NullBackend {
         self.playing = true;
         self.paused = false;
         self.last_url = Some(url.to_string());
+        self.position = 0.0;
         Ok(())
     }
 
@@ -96,6 +140,7 @@ impl AudioBackend for NullBackend {
     fn stop(&mut self) -> Result<()> {
         self.playing = false;
         self.paused = false;
+        self.position = 0.0;
         Ok(())
     }
 
@@ -105,12 +150,20 @@ impl AudioBackend for NullBackend {
     }
 
     fn poll_finished(&mut self) -> bool {
-        // The null backend never ends a track on its own.
         false
     }
 
     fn name(&self) -> &'static str {
         "null"
+    }
+
+    fn seek(&mut self, seconds: f64) -> Result<()> {
+        self.position = seconds.max(0.0);
+        Ok(())
+    }
+
+    fn position(&mut self) -> Option<f64> {
+        Some(self.position)
     }
 }
 
