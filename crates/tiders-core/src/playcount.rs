@@ -40,6 +40,15 @@ impl PlayCountStore {
         }
     }
 
+    /// Load, or an empty store still pointed at `path` (so later saves work).
+    pub fn load_or_empty(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_path_buf();
+        Self::load(&path).unwrap_or(Self {
+            counts: HashMap::new(),
+            path,
+        })
+    }
+
     /// Persist to disk (best-effort directory creation).
     pub fn save(&self) -> Result<()> {
         if let Some(dir) = self.path.parent() {
@@ -120,5 +129,19 @@ mod tests {
         store.counts.insert(track_key(&hot), 12);
         assert!(store.weight(&cold, false) > store.weight(&hot, false));
         assert!(store.weight(&hot, true) > store.weight(&cold, true));
+    }
+
+    #[test]
+    fn corrupt_json_keeps_path() {
+        let dir = std::env::temp_dir().join(format!("tiders-pc-bad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("playcounts.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let mut store = PlayCountStore::load_or_empty(&path);
+        assert_eq!(store.path, path);
+        let t = track("kept");
+        store.bump(&t);
+        assert_eq!(PlayCountStore::load(&path).unwrap().get(&t), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

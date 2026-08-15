@@ -104,6 +104,8 @@ pub struct Spectrum {
     pcm: Vec<f32>,
     pcm_len: usize,
     mags: Vec<f32>,
+    /// Instantaneous FFT band energy (target for gravity).
+    levels: Vec<f32>,
     bars: Vec<f32>,
     peaks: Vec<f32>,
     peak_age: Vec<f32>,
@@ -130,6 +132,7 @@ impl Spectrum {
             pcm: vec![0.0; FFT_SIZE],
             pcm_len: 0,
             mags: vec![0.0; FFT_SIZE / 2],
+            levels: vec![0.0; n_bars],
             bars: vec![0.0; n_bars],
             peaks: vec![0.0; n_bars],
             peak_age: vec![0.0; n_bars],
@@ -146,6 +149,7 @@ impl Spectrum {
             return;
         }
         self.n_bars = n_bars;
+        self.levels.resize(n_bars, 0.0);
         self.bars.resize(n_bars, 0.0);
         self.peaks.resize(n_bars, 0.0);
         self.peak_age.resize(n_bars, 0.0);
@@ -286,29 +290,29 @@ impl Spectrum {
                 wsum += lift;
             }
             let v = if wsum > 0.0 { acc / wsum } else { 0.0 };
-            self.bars[b] = v.clamp(0.0, 1.0);
+            self.levels[b] = v.clamp(0.0, 1.0);
         }
         // Monstercat-style horizontal smear.
         if self.n_bars > 2 {
-            let mut smeared = self.bars.clone();
+            let mut smeared = self.levels.clone();
             for i in 0..self.n_bars {
-                let mut v = self.bars[i];
+                let mut v = self.levels[i];
                 if i > 0 {
-                    v = v.max(self.bars[i - 1] / SMOOTH);
+                    v = v.max(self.levels[i - 1] / SMOOTH);
                 }
                 if i + 1 < self.n_bars {
-                    v = v.max(self.bars[i + 1] / SMOOTH);
+                    v = v.max(self.levels[i + 1] / SMOOTH);
                 }
                 smeared[i] = v;
             }
-            self.bars = smeared;
+            self.levels = smeared;
         }
     }
 
     fn apply_gravity(&mut self, dt: f32, playing: bool) {
         let dt = dt.clamp(0.0, 0.05);
         for i in 0..self.n_bars {
-            let target = if playing { self.bars[i] } else { 0.0 };
+            let target = if playing { self.levels[i] } else { 0.0 };
             if target >= self.bars[i] {
                 self.bars[i] = target;
                 self.vel[i] = 0.0;

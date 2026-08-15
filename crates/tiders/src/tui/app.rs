@@ -250,7 +250,7 @@ impl App {
             settings.volume,
             settings.replaygain.mpv_flag(),
         )?;
-        let counts = PlayCountStore::load(config.playcounts_path()).unwrap_or_default();
+        let counts = PlayCountStore::load_or_empty(config.playcounts_path());
         let quality_cursor = QUALITIES
             .iter()
             .position(|q| *q == settings.quality)
@@ -381,6 +381,11 @@ impl App {
             }
         }
 
+        let pcm = self.player.drain_pcm();
+        if !pcm.is_empty() {
+            self.spectrum.feed(&pcm);
+        }
+
         let playing = self.player.status() == PlayerStatus::Playing;
         let vol = self.player.volume() as f32 / 100.0;
         let bpm = self
@@ -391,10 +396,32 @@ impl App {
         let pos = self.elapsed_secs();
         let _ = self.spectrum.tick(dt, playing, vol, bpm, pos);
 
+        self.hydrate_toast_art().await;
+        if self.toast_alpha().is_none() {
+            self.toast = None;
+        }
+
         if self.last_media.elapsed() > Duration::from_millis(400) {
             self.publish_media();
             self.last_media = Instant::now();
         }
+    }
+
+    /// True while something is moving (spectrum, toasts, popups, login).
+    /// Idle screens park instead of painting 120 blank frames a second.
+    pub fn needs_frames(&self) -> bool {
+        if self.player.status() == PlayerStatus::Playing {
+            return true;
+        }
+        if self.toast.is_some() || self.popup.is_some() || self.loading || self.login.is_some()
+        {
+            return true;
+        }
+        if self.input_mode {
+            return true;
+        }
+        let target = if self.now_playing_mode { 1.0 } else { 0.0 };
+        (self.np_progress - target).abs() > 0.002
     }
 
     async fn handle_media(&mut self, cmd: MediaCommand) {
@@ -929,7 +956,7 @@ impl App {
         let Some(t0) = self.popup_opened else {
             return 1.0;
         };
-        super::anim::ease_out_cubic(t0.elapsed().as_secs_f32() / POPUP_OPEN_SECS)
+        super::anim::ease_out_quint(t0.elapsed().as_secs_f32() / POPUP_OPEN_SECS)
     }
 
     fn open_popup(&mut self, popup: Popup) {

@@ -8,20 +8,22 @@ mod ui;
 
 pub use app::App;
 
-use std::io;
-use std::time::Instant;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 
 use tiders_core::config::Config;
@@ -49,29 +51,62 @@ pub async fn run(config: Config) -> Result<()> {
     result
 }
 
-async fn event_loop<B: ratatui::backend::Backend>(
+/// Dedicated OS thread for input — grok-build's workaround for crossterm
+/// stranding `EventStream` wakers when the future is dropped inside `select!`.
+fn spawn_input_thread(tx: mpsc::UnboundedSender<KeyEvent>, stop: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("tiders-input".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match crossterm::event::poll(Duration::from_millis(16)) {
+                    Ok(true) => match crossterm::event::read() {
+                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            if tx.send(key).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+        .ok();
+}
+
+async fn event_loop<B: ratatui::backend::Backend + Write>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<()> {
-    let mut events = EventStream::new();
+    let (key_tx, mut key_rx) = mpsc::unbounded_channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    spawn_input_thread(key_tx, Arc::clone(&stop));
+
     let mut frames = interval(FRAME);
     frames.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last = Instant::now();
+    let mut last_idle_draw = Instant::now();
+    let mut dirty = true;
 
-    loop {
-        app.hydrate_toast_art().await;
-        terminal.draw(|frame| ui::draw(frame, app))?;
+    let result = loop {
+        if dirty {
+            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            dirty = false;
+        }
 
         tokio::select! {
             biased;
-            maybe = events.next() => {
+            maybe = key_rx.recv() => {
                 match maybe {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    Some(key) => {
                         handle_key(app, key).await;
+                        dirty = true;
                     }
-                    Some(Err(e)) => return Err(e.into()),
-                    None => break,
-                    _ => {}
+                    None => break Ok(()),
                 }
             }
             _ = frames.tick() => {
@@ -79,14 +114,20 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 let dt = now.saturating_duration_since(last).as_secs_f32();
                 last = now;
                 app.on_frame(dt).await;
+                if app.needs_frames() || last_idle_draw.elapsed() >= Duration::from_millis(250) {
+                    dirty = true;
+                    last_idle_draw = now;
+                }
             }
         }
 
         if app.should_quit {
-            break;
+            break Ok(());
         }
-    }
-    Ok(())
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    result
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) {
@@ -227,4 +268,3 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         _ => {}
     }
 }
-

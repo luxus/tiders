@@ -25,8 +25,7 @@ tracing-subscriber.workspace = true
 
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-futures = "0.3"
+crossterm = "0.28"
 open = "5"
 # Terminal image rendering (sixel/kitty/iterm2 with unicode-halfblock fallback).
 # default-features off drops the heavy AV1/AVIF codecs; TIDAL cover art is JPEG.

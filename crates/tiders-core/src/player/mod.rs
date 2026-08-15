@@ -311,6 +311,13 @@ impl Player {
             .or_else(|| self.now_playing.as_ref().map(|t| t.duration_secs as f64))
     }
 
+    /// Drain decoded PCM from the backend (empty if no tap is available).
+    pub fn drain_pcm(&mut self) -> Vec<f32> {
+        let mut dst = Vec::new();
+        self.backend.drain_pcm(&mut dst);
+        dst
+    }
+
     pub fn next_track(&mut self) -> Option<TrackView> {
         self.queue.advance().cloned()
     }

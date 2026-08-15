@@ -69,6 +69,14 @@ pub trait AudioBackend: Send {
         let _ = on;
         Ok(())
     }
+
+    /// Append recently decoded PCM samples (mono `f32`, ~44.1 kHz) into `dst`.
+    ///
+    /// Default is a no-op. The mpv backend drains a FIFO tap filled by a silent
+    /// `--ao=pcm` sidecar so the rustfft analyser sees real audio.
+    fn drain_pcm(&mut self, dst: &mut Vec<f32>) {
+        dst.clear();
+    }
 }
 
 /// A backend that tracks state but produces no sound.

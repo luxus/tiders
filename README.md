@@ -32,7 +32,9 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
 - **Now‑playing mode** — press `m` for a large cover, synced lyrics, a mini
   queue, and the spectrum (`Esc` back).
 - **Real FFT spectrum** — [rustfft](https://crates.io/crates/rustfft) analyser
-  with cava‑style gravity, peak hold, and EQ themes (`e` / `E`).
+  with cava‑style gravity, peak hold, and EQ themes (`e` / `E`). Decoded PCM is
+  tapped from a silent mpv `--ao=pcm` sidecar so the bars track the actual
+  stream (with a seeded synth fallback before the tap is ready).
 - **Stream quality** — live decoder details (FLAC / AAC, bit depth, kHz, kbps)
   from TIDAL’s manifest plus mpv’s `audio-params`.
 - **Shuffle & repeat** — shuffle off / random / favourites / discovery (`s`);
@@ -48,7 +50,10 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
   [ratatui-image](https://crates.io/crates/ratatui-image): kitty/sixel/iTerm2,
   with a unicode half‑block fallback.
 - **Smooth animation** — time‑based easing (not tick-counted frames) for
-  popups, the now‑playing layout, marquee, and toasts, presented at 120 Hz.
+  popups, the now‑playing layout, marquee, and toasts. The loop targets **120 Hz**
+  while something is moving (playback, spectrum, toasts) and parks when idle,
+  with terminal synchronized updates so frames don't tear. Input runs on its own
+  OS thread so the UI never blocks on mpv IPC.
 - **Scriptable CLI** — `login`, `search`, `play`, `favorites`, `playlists`,
   `whoami`, `logout`.
 - **Secure device‑code login** — OAuth device flow; the session is stored under
