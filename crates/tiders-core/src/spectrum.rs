@@ -10,6 +10,7 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use std::f32::consts::PI;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Number of FFT bins (power of two). 2048 @ 44.1 kHz ≈ 23 ms of audio.
 pub const FFT_SIZE: usize = 2048;
@@ -132,6 +133,7 @@ pub struct Spectrum {
     n_bars: usize,
     /// True once real PCM has been pushed (synth fallback is skipped).
     has_pcm: bool,
+    last_pcm: Option<Instant>,
     seed: u64,
 }
 
@@ -160,6 +162,7 @@ impl Spectrum {
             vel: vec![0.0; n_bars],
             n_bars,
             has_pcm: false,
+            last_pcm: None,
             seed: 0xC0FFEE,
         }
     }
@@ -182,24 +185,39 @@ impl Spectrum {
     pub fn set_seed(&mut self, seed: u64) {
         self.seed = seed.max(1);
         self.has_pcm = false;
+        self.last_pcm = None;
         self.pcm_len = 0;
     }
 
     /// Push interleaved-or-mono `f32` samples in `-1.0..=1.0`.
+    ///
+    /// Keeps the last [`FFT_SIZE`] samples with a single copy. The previous
+    /// per-sample `copy_within` was O(n²) and froze the analyser a few seconds
+    /// into a track once the PCM tap filled up.
     pub fn feed(&mut self, samples: &[f32]) {
         if samples.is_empty() {
             return;
         }
         self.has_pcm = true;
-        for &s in samples {
-            if self.pcm_len < FFT_SIZE {
-                self.pcm[self.pcm_len] = s;
-                self.pcm_len += 1;
-            } else {
-                self.pcm.copy_within(1.., 0);
-                self.pcm[FFT_SIZE - 1] = s;
-            }
+        self.last_pcm = Some(Instant::now());
+        if samples.len() >= FFT_SIZE {
+            self.pcm
+                .copy_from_slice(&samples[samples.len() - FFT_SIZE..]);
+            self.pcm_len = FFT_SIZE;
+            return;
         }
+        let n = samples.len();
+        if self.pcm_len + n <= FFT_SIZE {
+            self.pcm[self.pcm_len..self.pcm_len + n].copy_from_slice(samples);
+            self.pcm_len += n;
+            return;
+        }
+        let keep = FFT_SIZE - n;
+        if self.pcm_len > keep {
+            self.pcm.copy_within(self.pcm_len - keep..self.pcm_len, 0);
+        }
+        self.pcm[keep..FFT_SIZE].copy_from_slice(samples);
+        self.pcm_len = FFT_SIZE;
     }
 
     /// Advance by `dt` seconds. `playing` / `volume` / `bpm` / `position` drive
@@ -213,7 +231,11 @@ impl Spectrum {
         position: f64,
     ) -> SpectrumFrame {
         if playing {
-            if !self.has_pcm {
+            let pcm_fresh = self.has_pcm
+                && self
+                    .last_pcm
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(450));
+            if !pcm_fresh {
                 self.synthesize(position, bpm.max(60.0), volume.clamp(0.0, 1.0));
             }
             self.transform();
@@ -432,6 +454,19 @@ mod tests {
             "peak too quiet: {}",
             frame.bars[idx]
         );
+    }
+
+    #[test]
+    fn feed_keeps_last_window() {
+        let mut spec = Spectrum::new(16);
+        let mut samples = vec![0.0; FFT_SIZE * 3];
+        let n = samples.len();
+        samples[n - 1] = 1.0;
+        samples[n - 2] = 0.5;
+        spec.feed(&samples);
+        assert_eq!(spec.pcm_len, FFT_SIZE);
+        assert_eq!(spec.pcm[FFT_SIZE - 1], 1.0);
+        assert_eq!(spec.pcm[FFT_SIZE - 2], 0.5);
     }
 
     #[test]
