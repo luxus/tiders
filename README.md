@@ -94,39 +94,64 @@ binary onto your `PATH`.
 
 ```sh
 # after extracting, e.g.
-install -Dm755 tiders ~/.local/bin/tiders
+mkdir -p ~/.local/bin
+install -m 755 tiders ~/.local/bin/tiders
 ```
 
 ### Nix
 
-The flake exposes `packages.tiders`, `apps.tiders`, `devShells.default`, and an
-**overlay** you can drop into your own NixOS / home-manager / nix-darwin config:
+Needs [Nix](https://nixos.org/download/) with flakes (`nix-command` + `flakes`).
+`mpv` is wrapped onto the packaged binary's `PATH`, so you do not need to
+install it yourself.
+
+**Run without installing** (builds into the Nix store; nothing is added to your
+profile or system):
+
+```sh
+# from GitHub — launches the interactive TUI
+nix run github:luxus/tiders
+
+# CLI subcommands: everything after `--` is passed to tiders
+nix run github:luxus/tiders -- --help
+nix run github:luxus/tiders -- login
+nix run github:luxus/tiders -- search daft punk
+```
+
+From a local checkout of this repo:
+
+```sh
+nix run .                 # TUI
+nix run . -- --help
+nix build                 # ./result/bin/tiders
+nix flake check           # build + cargo tests + CLI smoke test
+nix develop               # rustc/cargo/clippy/rustfmt + mpv
+```
+
+**Install via overlay** (NixOS / home-manager / nix-darwin). Apply the overlay
+with the `nixpkgs.overlays` module option — `nixosSystem` does not take an
+`overlays` argument:
 
 ```nix
 # flake.nix
 {
   inputs.tiders.url = "github:luxus/tiders";
-  # …
-  outputs = { nixpkgs, tiders, … }: {
+
+  outputs = { nixpkgs, tiders, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      # …
-      overlays = [ tiders.overlays.default ];
-      # then: environment.systemPackages = [ pkgs.tiders ];
+      system = "x86_64-linux";
+      modules = [
+        ({ pkgs, ... }: {
+          nixpkgs.overlays = [ tiders.overlays.default ];
+          environment.systemPackages = [ pkgs.tiders ];
+        })
+      ];
     };
   };
 }
 ```
 
-From this repo (or `nix run github:luxus/tiders -- --help`):
-
-```sh
-nix build                 # ./result/bin/tiders
-nix run . -- --help       # run the packaged CLI
-nix flake check           # build + cargo tests + CLI smoke test
-nix develop               # rustc/cargo/clippy/rustfmt + mpv
-```
-
-`mpv` is wrapped onto the packaged binary's `PATH`.
+home-manager is the same idea: `nixpkgs.overlays = [ tiders.overlays.default ];`
+then `home.packages = [ pkgs.tiders ];`.
 
 ### Build
 
@@ -145,6 +170,12 @@ cargo build --release
 tiders            # launches the interactive UI (default)
 # or explicitly:
 tiders tui
+```
+
+Without installing Tiders, the same TUI is:
+
+```sh
+nix run github:luxus/tiders
 ```
 
 If you are not signed in, the TUI shows a **device‑login** screen with a URL and
