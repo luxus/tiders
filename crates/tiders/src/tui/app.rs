@@ -45,6 +45,7 @@ pub enum Screen {
 pub enum Tab {
     Search,
     Library,
+    Mixes,
     Favorites,
     Queue,
 }
@@ -54,6 +55,7 @@ impl Tab {
         match self {
             Tab::Search => "Search",
             Tab::Library => "Library",
+            Tab::Mixes => "Mixes",
             Tab::Favorites => "Favorites",
             Tab::Queue => "Queue",
         }
@@ -62,7 +64,8 @@ impl Tab {
     pub fn cycle(self) -> Self {
         match self {
             Tab::Search => Tab::Library,
-            Tab::Library => Tab::Favorites,
+            Tab::Library => Tab::Mixes,
+            Tab::Mixes => Tab::Favorites,
             Tab::Favorites => Tab::Queue,
             Tab::Queue => Tab::Search,
         }
@@ -179,9 +182,10 @@ pub struct LoginState {
 }
 
 pub struct Toast {
-    pub message: String,
+    pub title: String,
+    pub subtitle: Option<String>,
     pub cover: Option<String>,
-    pub art: Option<StatefulProtocol>,
+    pub art: Option<ratatui_image::protocol::StatefulProtocol>,
     pub started: Instant,
 }
 
@@ -243,6 +247,10 @@ pub struct App {
     pub tick: u64,
     pub should_quit: bool,
     last_media: Instant,
+    pub hits: super::hits::HitMap,
+    /// Local `file://` cover for macOS Now Playing (HTTP URLs are ignored).
+    media_cover_url: Option<String>,
+    media_cover_path: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -305,6 +313,9 @@ impl App {
             tick: 0,
             should_quit: false,
             last_media: Instant::now(),
+            hits: super::hits::HitMap::default(),
+            media_cover_url: None,
+            media_cover_path: None,
         };
 
         app.player.set_shuffle(settings.shuffle, Some(&app.counts));
@@ -385,38 +396,42 @@ impl App {
             }
         }
 
-        let pcm = self.player.drain_pcm();
-        if !pcm.is_empty() {
-            self.spectrum.feed(&pcm);
+        let playing = self.player.status() == PlayerStatus::Playing;
+        if self.settings.show_spectrum {
+            let pcm = self.player.drain_pcm();
+            if !pcm.is_empty() {
+                self.spectrum.feed(&pcm);
+            }
+            let vol = self.player.volume() as f32 / 100.0;
+            let bpm = self
+                .player
+                .now_playing()
+                .and_then(|t| t.bpm)
+                .unwrap_or(120.0);
+            let pos = self.elapsed_secs();
+            let _ = self.spectrum.tick(dt, playing, vol, bpm, pos);
         }
 
-        let playing = self.player.status() == PlayerStatus::Playing;
-        let vol = self.player.volume() as f32 / 100.0;
-        let bpm = self
-            .player
-            .now_playing()
-            .and_then(|t| t.bpm)
-            .unwrap_or(120.0);
-        let pos = self.elapsed_secs();
-        let _ = self.spectrum.tick(dt, playing, vol, bpm, pos);
-
-        self.hydrate_toast_art().await;
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.cover.is_some() && t.art.is_none())
+        {
+            self.hydrate_toast_art().await;
+        }
         if self.toast_alpha().is_none() {
             self.toast = None;
         }
 
-        if self.last_media.elapsed() > Duration::from_millis(400) {
+        if self.last_media.elapsed() > Duration::from_millis(1000) {
             self.publish_media();
             self.last_media = Instant::now();
         }
     }
 
-    /// True while something is moving (spectrum, toasts, popups, login).
-    /// Idle screens park instead of painting 120 blank frames a second.
+    /// True while something is animating (toasts, popups, login, now-playing morph).
+    /// Playback itself redraws at [`Self::playback_redraw_every`] — not 120 Hz.
     pub fn needs_frames(&self) -> bool {
-        if self.player.status() == PlayerStatus::Playing {
-            return true;
-        }
         if self.toast.is_some() || self.popup.is_some() || self.loading || self.login.is_some() {
             return true;
         }
@@ -425,6 +440,18 @@ impl App {
         }
         let target = if self.now_playing_mode { 1.0 } else { 0.0 };
         (self.np_progress - target).abs() > 0.002
+    }
+
+    /// Target redraw interval while a track is playing.
+    pub fn playback_redraw_every(&self) -> Duration {
+        if self.player.status() != PlayerStatus::Playing {
+            return Duration::from_millis(250);
+        }
+        if self.settings.show_spectrum {
+            Duration::from_millis(33)
+        } else {
+            Duration::from_millis(80)
+        }
     }
 
     async fn handle_media(&mut self, cmd: MediaCommand) {
@@ -449,7 +476,17 @@ impl App {
 
     fn publish_media(&mut self) {
         let track = self.player.now_playing().cloned();
-        let cover_url = track.as_ref().and_then(|t| t.cover_url(320));
+        let cover_url = self.media_cover_url.clone().or_else(|| {
+            // Linux MPRIS can fetch HTTP; macOS Now Playing cannot.
+            #[cfg(target_os = "linux")]
+            {
+                track.as_ref().and_then(|t| t.cover_url(320))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        });
         let position = Duration::from_secs_f64(self.elapsed_secs());
         let np = MediaNowPlaying {
             status: self.player.status(),
@@ -606,6 +643,11 @@ impl App {
                     }
                 }
             },
+            Tab::Mixes => {
+                if let Some(m) = self.mixes.get(self.sel_orig()).cloned() {
+                    self.open_mix(m.id, m.title).await;
+                }
+            }
             Tab::Favorites => match self.fav_section {
                 FavSection::Tracks => self.play_selected().await,
                 FavSection::Albums => {
@@ -787,7 +829,7 @@ impl App {
                 Ok(()) => {
                     self.stream_quality = info.quality;
                     self.spectrum.set_seed(track.id);
-                    self.set_status(format!("▶ {}", track.label()));
+                    self.notify_track(&track);
                     self.load_now_art(track.cover.clone()).await;
                     self.load_lyrics(track.id).await;
                     self.publish_media();
@@ -809,10 +851,26 @@ impl App {
     }
 
     async fn load_now_art(&mut self, cover: Option<String>) {
-        self.now_art = match cover {
-            Some(id) => self.art.protocol_for(&id).await,
+        self.now_art = match cover.as_ref() {
+            Some(id) => self.art.protocol_for(id).await,
             None => None,
         };
+        if let Some(old) = self.media_cover_path.take() {
+            let _ = std::fs::remove_file(old);
+        }
+        self.media_cover_url = None;
+        if let Some(id) = cover.as_ref() {
+            let url = tiders_core::images::cover_url(id, 320);
+            if let Ok(bytes) = tiders_core::images::fetch(&url).await {
+                let path = std::env::temp_dir()
+                    .join(format!("tiders-cover-{}-{id}.jpg", std::process::id()));
+                if std::fs::write(&path, bytes).is_ok() {
+                    self.media_cover_url = tiders_core::media::file_url(&path);
+                    self.media_cover_path = Some(path);
+                }
+            }
+        }
+        self.publish_media();
     }
 
     pub async fn play_next(&mut self) {
@@ -1031,14 +1089,26 @@ impl App {
     }
 
     pub fn set_status(&mut self, msg: String) {
-        let cover = self.player.now_playing().and_then(|t| t.cover.clone());
         self.toast = Some(Toast {
-            message: msg.clone(),
-            cover,
+            title: msg.clone(),
+            subtitle: None,
+            cover: None,
             art: None,
             started: Instant::now(),
         });
         self.status = msg;
+    }
+
+    /// Now-playing toast: title + artist, with cover art.
+    pub fn notify_track(&mut self, track: &TrackView) {
+        self.toast = Some(Toast {
+            title: track.title.clone(),
+            subtitle: Some(track.artist.clone()),
+            cover: track.cover.clone(),
+            art: None,
+            started: Instant::now(),
+        });
+        self.status = format!("▶ {}", track.label());
     }
 
     pub fn toast_alpha(&self) -> Option<f32> {
@@ -1157,6 +1227,11 @@ impl App {
                     .map(|c| format!("{} {}", c.title, c.subtitle))
                     .collect(),
             },
+            Tab::Mixes => self
+                .mixes
+                .iter()
+                .map(|m| format!("{} {}", m.title, m.subtitle))
+                .collect(),
             Tab::Favorites => match self.fav_section {
                 FavSection::Tracks => self.favorites.iter().map(track_haystack).collect(),
                 FavSection::Albums => self
@@ -1237,6 +1312,7 @@ impl App {
                 LibSection::Mixes => self.mixes.len(),
                 LibSection::ForYou => self.for_you.len(),
             },
+            Tab::Mixes => self.mixes.len(),
             Tab::Favorites => match self.fav_section {
                 FavSection::Tracks => self.favorites.len(),
                 FavSection::Albums => self.fav_albums.len(),
@@ -1255,9 +1331,42 @@ impl App {
 
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
+        if tab == Tab::Mixes {
+            self.lib_section = LibSection::Mixes;
+        }
         self.nav.clear();
         self.clear_filter();
         self.select_first();
+    }
+
+    pub fn set_lib_section(&mut self, section: LibSection) {
+        self.set_tab(Tab::Library);
+        self.lib_section = section;
+        self.clear_filter();
+        self.select_first();
+    }
+
+    pub fn set_fav_section(&mut self, section: FavSection) {
+        self.set_tab(Tab::Favorites);
+        self.fav_section = section;
+        self.clear_filter();
+        self.select_first();
+    }
+
+    pub fn seek_ratio(&mut self, ratio: f64) {
+        let Some(dur) = self.player.duration() else {
+            return;
+        };
+        let _ = self.player.seek((dur * ratio.clamp(0.0, 1.0)).max(0.0));
+    }
+
+    pub fn select_index(&mut self, index: usize) {
+        let len = self.current_len();
+        if len == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        self.list_state.select(Some(index.min(len - 1)));
     }
 
     pub fn select_first(&mut self) {
@@ -1291,6 +1400,7 @@ impl App {
         match self.tab {
             Tab::Search => format!("Search · {}", self.search_scope.title()),
             Tab::Library => format!("Library · {}", self.lib_section.title()),
+            Tab::Mixes => "My Mixes".into(),
             Tab::Favorites => format!("Favorites · {}", self.fav_section.title()),
             Tab::Queue => "Queue".into(),
         }
