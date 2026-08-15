@@ -110,7 +110,23 @@ is the same seam the desktop version would use.
 `mpv` is only needed at runtime for actual audio; everything else (login,
 search, browsing) works without it.
 
-### Build
+### GitHub Releases
+
+Prebuilt binaries for Linux (`x86_64`) and macOS (`aarch64` and Intel) are
+attached to [GitHub Releases](https://github.com/luxus/tiders/releases). Tiders
+is **not** published to crates.io because the TIDAL client (`tidlers`) is a git
+dependency.
+
+```sh
+# Linux x86_64 example — check the latest release for other targets
+curl -sL https://github.com/luxus/tiders/releases/latest/download/tiders-x86_64-unknown-linux-gnu.tar.gz | tar xz
+./tiders-x86_64-unknown-linux-gnu/tiders --help
+```
+
+macOS binaries are unsigned; Gatekeeper may ask you to allow the app on first
+run.
+
+### Build from source
 
 ```sh
 git clone https://github.com/luxus/tiders.git
@@ -197,6 +213,26 @@ For headless/CI use, a full session JSON can be supplied via the
 first use. On machines without an audio device (CI, servers), set
 `TIDERS_MPV_AO=null` so `mpv` decodes the stream in real time without opening an
 output.
+
+## CI and releases
+
+GitHub Actions runs on every pull request and every push to `main`:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace` on **Linux and macOS** (unit tests do not need `mpv`)
+
+Releases are automated with [release-plz](https://release-plz.dev) from
+[Conventional Commits](https://www.conventionalcommits.org) (`feat:`, `fix:`, …):
+
+1. Merging to `main` opens a **release PR** that bumps the workspace version and
+   updates [`CHANGELOG.md`](CHANGELOG.md).
+2. Merging that PR tags `vX.Y.Z` and creates a **GitHub Release**.
+3. A tag workflow builds and uploads Linux/macOS binaries to that release.
+
+This does **not** run `cargo publish`. To allow the release PR, enable
+**Allow GitHub Actions to create and approve pull requests** under
+Settings → Actions → General → Workflow permissions.
 
 ## Roadmap
 

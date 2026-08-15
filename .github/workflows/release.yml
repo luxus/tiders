@@ -1,0 +1,73 @@
+# Attach platform binaries to the GitHub Release created by release-plz.
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    if: github.repository == 'luxus/tiders'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin tiders --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          stage="tiders-${{ matrix.target }}"
+          mkdir -p "$stage"
+          bin="target/${{ matrix.target }}/release/tiders"
+          cp "$bin" "$stage/tiders"
+          cp README.md LICENSE "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+          sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256" || shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          files=(
+            "tiders-${{ matrix.target }}.tar.gz"
+            "tiders-${{ matrix.target }}.tar.gz.sha256"
+          )
+          # release-plz creates the GitHub Release just after pushing the tag;
+          # wait briefly so we attach assets instead of racing a second release.
+          for i in $(seq 1 18); do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" "${files[@]}" --clobber
+              exit 0
+            fi
+            echo "Waiting for GitHub Release $tag ($i/18)"
+            sleep 10
+          done
+          gh release create "$tag" "${files[@]}" --generate-notes --verify-tag

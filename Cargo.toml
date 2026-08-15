@@ -9,6 +9,8 @@ license = "MIT"
 repository = "https://github.com/luxus/tiders"
 authors = ["Tiders authors"]
 rust-version = "1.85"
+# Not on crates.io: `tidlers` is a git dependency.
+publish = false
 
 [workspace.dependencies]
 tiders-core = { path = "crates/tiders-core" }
