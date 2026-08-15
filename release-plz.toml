@@ -15,8 +15,8 @@ changelog_path = "CHANGELOG.md"
 changelog_include = ["tiders-core"]
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
-git_release_enable = true
-git_release_name = "v{{ version }}"
+# GitHub Release + binaries are created by `.github/workflows/release.yml`.
+git_release_enable = false
 version_group = "tiders"
 
 [[package]]

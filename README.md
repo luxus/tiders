@@ -112,19 +112,77 @@ search, browsing) works without it.
 
 ### GitHub Releases
 
-Prebuilt binaries for Linux (`x86_64`) and macOS (`aarch64` and Intel) are
-attached to [GitHub Releases](https://github.com/luxus/tiders/releases). Tiders
-is **not** published to crates.io because the TIDAL client (`tidlers`) is a git
-dependency.
+Tagged versions (`vX.Y.Z`) publish Linux (`x86_64` and `aarch64`) and macOS
+(`aarch64` and Intel) binaries via GitHub Actions. Grab the archive for your
+platform from [Releases](https://github.com/luxus/tiders/releases) and unpack
+the `tiders` binary onto your `PATH`.
+
+Tiders is **not** published to crates.io because the TIDAL client (`tidlers`)
+is a git dependency.
 
 ```sh
-# Linux x86_64 example — check the latest release for other targets
-curl -sL https://github.com/luxus/tiders/releases/latest/download/tiders-x86_64-unknown-linux-gnu.tar.gz | tar xz
-./tiders-x86_64-unknown-linux-gnu/tiders --help
+# after extracting, e.g.
+mkdir -p ~/.local/bin
+install -m 755 tiders ~/.local/bin/tiders
 ```
 
 macOS binaries are unsigned; Gatekeeper may ask you to allow the app on first
 run.
+
+### Nix
+
+Needs [Nix](https://nixos.org/download/) with flakes (`nix-command` + `flakes`).
+`mpv` is wrapped onto the packaged binary's `PATH`, so you do not need to
+install it yourself.
+
+**Run without installing** (builds into the Nix store; nothing is added to your
+profile or system):
+
+```sh
+# from GitHub — launches the interactive TUI
+nix run github:luxus/tiders
+
+# CLI subcommands: everything after `--` is passed to tiders
+nix run github:luxus/tiders -- --help
+nix run github:luxus/tiders -- login
+nix run github:luxus/tiders -- search daft punk
+```
+
+From a local checkout of this repo:
+
+```sh
+nix run .                 # TUI
+nix run . -- --help
+nix build                 # ./result/bin/tiders
+nix flake check           # build + cargo tests + CLI smoke test
+nix develop               # rustc/cargo/clippy/rustfmt + mpv
+```
+
+**Install via overlay** (NixOS / home-manager / nix-darwin). Apply the overlay
+with the `nixpkgs.overlays` module option — `nixosSystem` does not take an
+`overlays` argument:
+
+```nix
+# flake.nix
+{
+  inputs.tiders.url = "github:luxus/tiders";
+
+  outputs = { nixpkgs, tiders, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ({ pkgs, ... }: {
+          nixpkgs.overlays = [ tiders.overlays.default ];
+          environment.systemPackages = [ pkgs.tiders ];
+        })
+      ];
+    };
+  };
+}
+```
+
+home-manager is the same idea: `nixpkgs.overlays = [ tiders.overlays.default ];`
+then `home.packages = [ pkgs.tiders ];`.
 
 ### Build from source
 
@@ -227,8 +285,9 @@ Releases are automated with [release-plz](https://release-plz.dev) from
 
 1. Merging to `main` opens a **release PR** that bumps the workspace version and
    updates [`CHANGELOG.md`](CHANGELOG.md).
-2. Merging that PR tags `vX.Y.Z` and creates a **GitHub Release**.
-3. A tag workflow builds and uploads Linux/macOS binaries to that release.
+2. Merging that PR tags `vX.Y.Z`.
+3. The existing tag workflow builds Linux/macOS archives and publishes a
+   **GitHub Release** with those binaries.
 
 This does **not** run `cargo publish`. To allow the release PR, enable
 **Allow GitHub Actions to create and approve pull requests** under

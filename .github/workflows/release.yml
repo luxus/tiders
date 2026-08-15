@@ -1,34 +1,48 @@
-# Attach platform binaries to the GitHub Release created by release-plz.
-name: Release binaries
+name: Release
 
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (leave empty to use the current ref)"
+        required: false
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: tiders
 
 jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    if: github.repository == 'luxus/tiders'
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -36,38 +50,67 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --bin tiders --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin "$BIN" --target ${{ matrix.target }}
 
       - name: Package
+        shell: bash
         run: |
-          stage="tiders-${{ matrix.target }}"
-          mkdir -p "$stage"
-          bin="target/${{ matrix.target }}/release/tiders"
-          cp "$bin" "$stage/tiders"
-          cp README.md LICENSE "$stage/"
-          tar -czf "$stage.tar.gz" "$stage"
-          sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256" || shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="${tag#refs/tags/}"
+          # Tag names may contain `/`; keep archive names as single path components.
+          safe_tag="${tag//\//-}"
+          staging="${BIN}-${safe_tag}-${{ matrix.target }}"
+          mkdir -p "$staging" dist
+          cp "target/${{ matrix.target }}/release/${BIN}" "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar -czf "${staging}.tar.gz" "$staging"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${staging}.tar.gz" | tee "${staging}.tar.gz.sha256"
+          else
+            shasum -a 256 "${staging}.tar.gz" | tee "${staging}.tar.gz.sha256"
+          fi
+          mv "${staging}.tar.gz" "${staging}.tar.gz.sha256" dist/
 
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BIN }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release
+    needs: build
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
         run: |
-          tag="${GITHUB_REF_NAME}"
-          files=(
-            "tiders-${{ matrix.target }}.tar.gz"
-            "tiders-${{ matrix.target }}.tar.gz.sha256"
-          )
-          # release-plz creates the GitHub Release just after pushing the tag;
-          # wait briefly so we attach assets instead of racing a second release.
-          for i in $(seq 1 18); do
-            if gh release view "$tag" >/dev/null 2>&1; then
-              gh release upload "$tag" "${files[@]}" --clobber
-              exit 0
-            fi
-            echo "Waiting for GitHub Release $tag ($i/18)"
-            sleep 10
-          done
-          gh release create "$tag" "${files[@]}" --generate-notes --verify-tag
+          set -euo pipefail
+          cd dist
+          cat *.sha256 | sort > sha256sums.txt
+          ls -la
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, 'alpha') || contains(github.event.inputs.tag || github.ref_name, 'beta') || contains(github.event.inputs.tag || github.ref_name, 'rc') }}
+          files: dist/*
