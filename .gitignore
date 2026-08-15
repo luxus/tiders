@@ -6,3 +6,8 @@ Cargo.lock.bak
 # local session/credentials must never be committed
 session.json
 /.tiders
+# Nix
+result
+result-*
+.direnv
+

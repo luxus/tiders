@@ -85,6 +85,49 @@ is the same seam the desktop version would use.
 `mpv` is only needed at runtime for actual audio; everything else (login,
 search, browsing) works without it.
 
+### GitHub Releases
+
+Tagged versions (`vX.Y.Z`) publish Linux and macOS binaries via GitHub Actions.
+Grab the archive for your platform from
+[Releases](https://github.com/luxus/tiders/releases) and unpack the `tiders`
+binary onto your `PATH`.
+
+```sh
+# after extracting, e.g.
+install -Dm755 tiders ~/.local/bin/tiders
+```
+
+### Nix
+
+The flake exposes `packages.tiders`, `apps.tiders`, `devShells.default`, and an
+**overlay** you can drop into your own NixOS / home-manager / nix-darwin config:
+
+```nix
+# flake.nix
+{
+  inputs.tiders.url = "github:luxus/tiders";
+  # …
+  outputs = { nixpkgs, tiders, … }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      # …
+      overlays = [ tiders.overlays.default ];
+      # then: environment.systemPackages = [ pkgs.tiders ];
+    };
+  };
+}
+```
+
+From this repo (or `nix run github:luxus/tiders -- --help`):
+
+```sh
+nix build                 # ./result/bin/tiders
+nix run . -- --help       # run the packaged CLI
+nix flake check           # build + cargo tests + CLI smoke test
+nix develop               # rustc/cargo/clippy/rustfmt + mpv
+```
+
+`mpv` is wrapped onto the packaged binary's `PATH`.
+
 ### Build
 
 ```sh
