@@ -44,8 +44,10 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Search,
-    Library,
+    Home,
     Mixes,
+    Library,
+    Playlists,
     Favorites,
     Queue,
 }
@@ -54,8 +56,10 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Tab::Search => "Search",
-            Tab::Library => "Library",
+            Tab::Home => "For You",
             Tab::Mixes => "Mixes",
+            Tab::Library => "Library",
+            Tab::Playlists => "Playlists",
             Tab::Favorites => "Favorites",
             Tab::Queue => "Queue",
         }
@@ -63,38 +67,90 @@ impl Tab {
 
     pub fn cycle(self) -> Self {
         match self {
-            Tab::Search => Tab::Library,
-            Tab::Library => Tab::Mixes,
-            Tab::Mixes => Tab::Favorites,
+            Tab::Search => Tab::Home,
+            Tab::Home => Tab::Mixes,
+            Tab::Mixes => Tab::Library,
+            Tab::Library => Tab::Playlists,
+            Tab::Playlists => Tab::Favorites,
             Tab::Favorites => Tab::Queue,
             Tab::Queue => Tab::Search,
         }
     }
+
+    pub fn all() -> [Tab; 7] {
+        [
+            Tab::Search,
+            Tab::Home,
+            Tab::Mixes,
+            Tab::Library,
+            Tab::Playlists,
+            Tab::Favorites,
+            Tab::Queue,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibSection {
-    Playlists,
-    Mixes,
-    ForYou,
+pub enum SortKey {
+    Title,
+    Artist,
+    Album,
+    Time,
 }
 
-impl LibSection {
+impl SortKey {
     pub fn title(self) -> &'static str {
         match self {
-            LibSection::Playlists => "Playlists",
-            LibSection::Mixes => "My Mixes",
-            LibSection::ForYou => "For You",
+            SortKey::Title => "Title",
+            SortKey::Artist => "Artist",
+            SortKey::Album => "Album",
+            SortKey::Time => "Time",
         }
     }
 
     pub fn cycle(self) -> Self {
         match self {
-            LibSection::Playlists => LibSection::Mixes,
-            LibSection::Mixes => LibSection::ForYou,
-            LibSection::ForYou => LibSection::Playlists,
+            SortKey::Title => SortKey::Artist,
+            SortKey::Artist => SortKey::Album,
+            SortKey::Album => SortKey::Time,
+            SortKey::Time => SortKey::Title,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    GoArtist,
+    GoAlbum,
+    ToggleFav,
+    Like,
+    Dislike,
+}
+
+impl ContextAction {
+    pub fn all() -> [ContextAction; 5] {
+        [
+            ContextAction::GoArtist,
+            ContextAction::GoAlbum,
+            ContextAction::ToggleFav,
+            ContextAction::Like,
+            ContextAction::Dislike,
+        ]
+    }
+}
+
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    pub cursor: usize,
+    pub track: TrackView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Main,
+    Sidebar,
+    NpQueue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +220,7 @@ pub enum Popup {
     Help,
     Detail(Box<TrackView>),
     Quality,
+    Context(Box<ContextMenu>),
 }
 
 #[derive(Debug)]
@@ -200,10 +257,12 @@ pub struct App {
 
     pub screen: Screen,
     pub tab: Tab,
-    pub lib_section: LibSection,
     pub fav_section: FavSection,
     pub search_scope: SearchScope,
     pub nav: Vec<Page>,
+    pub focus: Focus,
+    pub sort_key: SortKey,
+    pub sort_asc: bool,
 
     pub input_mode: bool,
     pub input: String,
@@ -221,9 +280,13 @@ pub struct App {
     pub page_tracks: Vec<TrackView>,
     pub page_albums: Vec<AlbumView>,
     pub page_bio: String,
+    pub page_artist: Option<ArtistView>,
+    pub page_art: Option<StatefulProtocol>,
     pub loved: std::collections::HashSet<u64>,
+    pub home_error: Option<String>,
 
     pub list_state: ListState,
+    pub np_queue_state: ListState,
 
     pub art: ArtManager,
     pub now_art: Option<StatefulProtocol>,
@@ -277,10 +340,12 @@ impl App {
             spectrum: Spectrum::new(48),
             screen: Screen::Login,
             tab: Tab::Search,
-            lib_section: LibSection::Playlists,
             fav_section: FavSection::Tracks,
             search_scope: SearchScope::Tracks,
             nav: Vec::new(),
+            focus: Focus::Main,
+            sort_key: SortKey::Title,
+            sort_asc: true,
             input_mode: false,
             input: String::new(),
             filter_hits: None,
@@ -294,8 +359,12 @@ impl App {
             page_tracks: Vec::new(),
             page_albums: Vec::new(),
             page_bio: String::new(),
+            page_artist: None,
+            page_art: None,
             loved: std::collections::HashSet::new(),
+            home_error: None,
             list_state: ListState::default(),
+            np_queue_state: ListState::default(),
             art,
             now_art: None,
             detail_art: None,
@@ -533,15 +602,23 @@ impl App {
             return;
         }
         self.loading = true;
-        let tracks = self.service.as_ref().unwrap().favorite_tracks(200, 0).await;
+        let tracks = self
+            .service
+            .as_ref()
+            .unwrap()
+            .favorite_tracks_all(2000)
+            .await;
         let albums = self.service.as_ref().unwrap().favorite_albums(100, 0).await;
         let artists = self.service.as_ref().unwrap().favorite_artists(100).await;
         self.loading = false;
-        if let Ok(tracks) = tracks {
-            self.loved = tracks.iter().map(|t| t.id).collect();
-            let n = tracks.len();
-            self.favorites = tracks;
-            self.set_status(format!("Loaded {n} favorite track(s)"));
+        match tracks {
+            Ok(tracks) => {
+                self.loved = tracks.iter().map(|t| t.id).collect();
+                let n = tracks.len();
+                self.favorites = tracks;
+                self.set_status(format!("Loaded {n} saved song(s)"));
+            }
+            Err(e) => self.set_status(format!("Library: {e}")),
         }
         if let Ok(albums) = albums {
             self.fav_albums = albums;
@@ -569,8 +646,15 @@ impl App {
             Ok((mixes, cards)) => {
                 self.mixes = mixes;
                 self.for_you = cards;
+                self.home_error = None;
+                if self.mixes.is_empty() && self.for_you.is_empty() {
+                    self.home_error = Some("TIDAL returned no mixes or For You cards.".into());
+                }
             }
-            Err(e) => self.set_status(format!("Home feed: {e}")),
+            Err(e) => {
+                self.home_error = Some(e.to_string());
+                self.set_status(format!("Home feed: {e}"));
+            }
         }
     }
 
@@ -623,26 +707,20 @@ impl App {
                     }
                 }
             },
-            Tab::Library => match self.lib_section {
-                LibSection::Playlists => {
-                    if let Some(p) = self.playlists.get(self.sel_orig()).cloned() {
-                        self.open_playlist(p.uuid, p.title).await;
-                    }
+            Tab::Home => {
+                if let Some(c) = self.for_you.get(self.sel_orig()).cloned() {
+                    self.open_card(c).await;
                 }
-                LibSection::Mixes => {
-                    if let Some(m) = self.mixes.get(self.sel_orig()).cloned() {
-                        self.open_mix(m.id, m.title).await;
-                    }
-                }
-                LibSection::ForYou => {
-                    if let Some(c) = self.for_you.get(self.sel_orig()).cloned() {
-                        self.open_card(c).await;
-                    }
-                }
-            },
+            }
             Tab::Mixes => {
                 if let Some(m) = self.mixes.get(self.sel_orig()).cloned() {
                     self.open_mix(m.id, m.title).await;
+                }
+            }
+            Tab::Library => self.play_selected().await,
+            Tab::Playlists => {
+                if let Some(p) = self.playlists.get(self.sel_orig()).cloned() {
+                    self.open_playlist(p.uuid, p.title).await;
                 }
             }
             Tab::Favorites => match self.fav_section {
@@ -671,7 +749,7 @@ impl App {
         }
     }
 
-    async fn open_playlist(&mut self, uuid: String, title: String) {
+    pub async fn open_playlist(&mut self, uuid: String, title: String) {
         if self.service.is_none() {
             return;
         }
@@ -730,20 +808,40 @@ impl App {
             return;
         }
         self.loading = true;
+        let profile = self.service.as_ref().unwrap().artist(id).await;
         let tracks = self.service.as_ref().unwrap().artist_tracks(id).await;
         let albums = self.service.as_ref().unwrap().artist_albums(id).await;
         let bio = self.service.as_ref().unwrap().artist_bio(id).await;
         self.loading = false;
-        match tracks {
-            Ok(tracks) => {
-                self.page_tracks = tracks;
-                self.page_albums = albums.unwrap_or_default();
-                self.page_bio = bio.unwrap_or_default();
-                self.nav.push(Page::Artist { id, name });
-                self.clear_filter();
-                self.select_first();
-            }
-            Err(e) => self.set_status(format!("Artist: {e}")),
+        self.page_tracks = tracks.unwrap_or_default();
+        self.page_albums = albums.unwrap_or_default();
+        self.page_bio = bio.unwrap_or_default();
+        self.page_artist = profile.ok().or(Some(ArtistView {
+            id,
+            name: name.clone(),
+            picture: None,
+            mix_id: None,
+        }));
+        self.page_art = None;
+        if let Some(pic) = self
+            .page_artist
+            .as_ref()
+            .and_then(|a| a.picture.clone())
+            .or_else(|| self.page_albums.first().and_then(|a| a.cover.clone()))
+        {
+            self.page_art = self.art.protocol_for(&pic).await;
+        }
+        self.nav.push(Page::Artist { id, name });
+        self.clear_filter();
+        self.select_first();
+        if self.page_tracks.is_empty() && self.page_albums.is_empty() {
+            self.set_status("Artist loaded with no songs or albums yet".into());
+        }
+    }
+
+    pub async fn open_page_album(&mut self, index: usize) {
+        if let Some(a) = self.page_albums.get(index).cloned() {
+            self.open_album(a.id, a.title).await;
         }
     }
 
@@ -765,6 +863,8 @@ impl App {
             self.page_tracks.clear();
             self.page_albums.clear();
             self.page_bio.clear();
+            self.page_artist = None;
+            self.page_art = None;
             self.recompute_filter();
             self.select_first();
             return true;
@@ -962,17 +1062,154 @@ impl App {
 
     pub async fn toggle_love(&mut self) {
         let Some(track) = self
-            .player
-            .now_playing()
-            .cloned()
-            .or_else(|| self.selected_track())
+            .selected_track()
+            .or_else(|| self.player.now_playing().cloned())
         else {
             return;
         };
+        self.apply_love(&track, false).await;
+    }
+
+    pub fn toggle_now_playing_mode(&mut self) {
+        self.now_playing_mode = !self.now_playing_mode;
+        if self.now_playing_mode {
+            self.focus = Focus::NpQueue;
+            self.sync_np_queue_selection();
+        } else if self.focus == Focus::NpQueue {
+            self.focus = Focus::Main;
+        }
+    }
+
+    pub fn sync_np_queue_selection(&mut self) {
+        let cur = self.player.queue().cursor();
+        self.np_queue_state.select(cur);
+    }
+
+    pub fn move_np_queue(&mut self, delta: isize) {
+        let len = self.player.queue().len();
+        if len == 0 {
+            self.np_queue_state.select(None);
+            return;
+        }
+        let current = self.np_queue_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len as isize) as usize;
+        self.np_queue_state.select(Some(next));
+    }
+
+    pub async fn activate_np_queue(&mut self) {
+        let Some(i) = self.np_queue_state.selected() else {
+            return;
+        };
+        if self.player.select(i).is_some() {
+            self.persist_queue();
+            self.play_current().await;
+        }
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.settings.sidebar_visible = !self.settings.sidebar_visible;
+        let _ = self.config.save_settings(&self.settings);
+        if !self.settings.sidebar_visible && self.focus == Focus::Sidebar {
+            self.focus = Focus::Main;
+        }
+    }
+
+    pub fn cycle_sort(&mut self) {
+        if self.showing_tracks() {
+            self.sort_key = self.sort_key.cycle();
+            self.set_status(format!(
+                "Sort by {} {}",
+                self.sort_key.title(),
+                if self.sort_asc { "↑" } else { "↓" }
+            ));
+        }
+    }
+
+    pub fn set_sort(&mut self, key: SortKey) {
+        if self.sort_key == key {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_key = key;
+            self.sort_asc = true;
+        }
+        self.set_status(format!(
+            "Sort by {} {}",
+            self.sort_key.title(),
+            if self.sort_asc { "↑" } else { "↓" }
+        ));
+    }
+
+    pub fn open_context(&mut self, x: u16, y: u16, track: TrackView) {
+        self.open_popup(Popup::Context(Box::new(ContextMenu {
+            x,
+            y,
+            cursor: 0,
+            track,
+        })));
+    }
+
+    pub fn context_move(&mut self, delta: isize) {
+        if let Some(Popup::Context(menu)) = self.popup.as_mut() {
+            let n = ContextAction::all().len() as isize;
+            menu.cursor = (menu.cursor as isize + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    pub async fn context_activate(&mut self) {
+        let Some(Popup::Context(menu)) = self.popup.take() else {
+            return;
+        };
+        self.popup_opened = None;
+        let action = ContextAction::all()[menu.cursor.min(ContextAction::all().len() - 1)];
+        self.run_context_action(action, menu.track).await;
+    }
+
+    pub async fn run_context_action(&mut self, action: ContextAction, track: TrackView) {
+        match action {
+            ContextAction::GoArtist => {
+                if let Some(id) = track.artist_id {
+                    self.open_artist(id, track.artist).await;
+                } else {
+                    self.set_status("No artist id on this track".into());
+                }
+            }
+            ContextAction::GoAlbum => {
+                if let (Some(id), Some(title)) = (track.album_id, track.album.clone()) {
+                    self.open_album(id, title).await;
+                } else {
+                    self.set_status("No album id on this track".into());
+                }
+            }
+            ContextAction::ToggleFav | ContextAction::Like => {
+                self.apply_love(&track, action == ContextAction::Like).await;
+            }
+            ContextAction::Dislike => {
+                if let Some(service) = self.service.as_ref() {
+                    let _ = service.dislike_track(track.id).await;
+                }
+                if self.loved.contains(&track.id) {
+                    if let Some(service) = self.service.as_ref() {
+                        let _ = service.unlove_track(track.id).await;
+                    }
+                    self.loved.remove(&track.id);
+                }
+                self.set_status(format!("Don't like {}", track.title));
+                if self.player.now_playing().is_some_and(|t| t.id == track.id) {
+                    self.play_next().await;
+                }
+            }
+        }
+    }
+
+    async fn apply_love(&mut self, track: &TrackView, force_like: bool) {
         if self.service.is_none() {
             return;
         }
         let loved = self.loved.contains(&track.id);
+        if force_like && loved {
+            self.set_status(format!("Already liked {}", track.title));
+            return;
+        }
         let result = if loved {
             self.service.as_ref().unwrap().unlove_track(track.id).await
         } else {
@@ -982,18 +1219,14 @@ impl App {
             Ok(()) => {
                 if loved {
                     self.loved.remove(&track.id);
-                    self.set_status(format!("Unloved {}", track.title));
+                    self.set_status(format!("Removed {} from favorites", track.title));
                 } else {
                     self.loved.insert(track.id);
-                    self.set_status(format!("Loved {}", track.title));
+                    self.set_status(format!("Liked {}", track.title));
                 }
             }
-            Err(e) => self.set_status(format!("Love: {e}")),
+            Err(e) => self.set_status(format!("Favorite: {e}")),
         }
-    }
-
-    pub fn toggle_now_playing_mode(&mut self) {
-        self.now_playing_mode = !self.now_playing_mode;
     }
 
     pub fn toggle_spectrum(&mut self) {
@@ -1141,13 +1374,31 @@ impl App {
         self.list_state.selected().unwrap_or(0)
     }
 
-    /// Map a filtered row index back onto the unfiltered source list.
+    /// Map a filtered/sorted row index back onto the unfiltered source list.
     pub fn orig_at(&self, filtered: usize) -> usize {
-        self.filter_hits
-            .as_ref()
-            .and_then(|hits| hits.get(filtered))
-            .map(|h| h.index)
+        self.view_indices()
+            .get(filtered)
+            .copied()
             .unwrap_or(filtered)
+    }
+
+    pub fn view_indices(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = match &self.filter_hits {
+            Some(hits) => hits.iter().map(|h| h.index).collect(),
+            None => (0..self.unfiltered_len()).collect(),
+        };
+        if self.showing_tracks() {
+            let tracks = self.unfiltered_tracks();
+            idx.sort_by(|&a, &b| {
+                let cmp = cmp_tracks(tracks.get(a), tracks.get(b), self.sort_key);
+                if self.sort_asc {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
+        }
+        idx
     }
 
     /// Map the highlighted (filtered) row back onto the unfiltered source list.
@@ -1160,7 +1411,8 @@ impl App {
     }
 
     pub fn hit_at(&self, filtered_index: usize) -> Option<&super::filter::Hit> {
-        self.filter_hits.as_ref()?.get(filtered_index)
+        let src = self.orig_at(filtered_index);
+        self.filter_hits.as_ref()?.iter().find(|h| h.index == src)
     }
 
     pub fn clear_filter(&mut self) {
@@ -1205,27 +1457,21 @@ impl App {
                     .map(|p| format!("{} {}", p.title, p.description.clone().unwrap_or_default()))
                     .collect(),
             },
-            Tab::Library => match self.lib_section {
-                LibSection::Playlists => self
-                    .playlists
-                    .iter()
-                    .map(|p| format!("{} {}", p.title, p.description.clone().unwrap_or_default()))
-                    .collect(),
-                LibSection::Mixes => self
-                    .mixes
-                    .iter()
-                    .map(|m| format!("{} {}", m.title, m.subtitle))
-                    .collect(),
-                LibSection::ForYou => self
-                    .for_you
-                    .iter()
-                    .map(|c| format!("{} {}", c.title, c.subtitle))
-                    .collect(),
-            },
+            Tab::Home => self
+                .for_you
+                .iter()
+                .map(|c| format!("{} {}", c.title, c.subtitle))
+                .collect(),
             Tab::Mixes => self
                 .mixes
                 .iter()
                 .map(|m| format!("{} {}", m.title, m.subtitle))
+                .collect(),
+            Tab::Library => self.favorites.iter().map(track_haystack).collect(),
+            Tab::Playlists => self
+                .playlists
+                .iter()
+                .map(|p| format!("{} {}", p.title, p.description.clone().unwrap_or_default()))
                 .collect(),
             Tab::Favorites => match self.fav_section {
                 FavSection::Tracks => self.favorites.iter().map(track_haystack).collect(),
@@ -1246,6 +1492,14 @@ impl App {
         }
     }
 
+    pub fn signed_in(&self) -> bool {
+        self.service.is_some()
+    }
+
+    pub fn artist_page(&self) -> bool {
+        matches!(self.nav.last(), Some(Page::Artist { .. }))
+    }
+
     pub fn selected_track(&self) -> Option<TrackView> {
         let (tracks, idx) = self.current_tracks_with_selection();
         tracks.get(idx).cloned()
@@ -1263,7 +1517,7 @@ impl App {
 
     pub fn showing_tracks(&self) -> bool {
         !self.nav.is_empty()
-            || matches!(self.tab, Tab::Queue)
+            || matches!(self.tab, Tab::Queue | Tab::Library)
             || (self.tab == Tab::Favorites && self.fav_section == FavSection::Tracks)
             || (self.tab == Tab::Search && self.search_scope == SearchScope::Tracks)
     }
@@ -1274,6 +1528,7 @@ impl App {
         }
         match self.tab {
             Tab::Search if self.search_scope == SearchScope::Tracks => self.results.tracks.clone(),
+            Tab::Library => self.favorites.clone(),
             Tab::Favorites if self.fav_section == FavSection::Tracks => self.favorites.clone(),
             Tab::Queue => self.player.queue().items().to_vec(),
             _ => Vec::new(),
@@ -1282,13 +1537,10 @@ impl App {
 
     pub fn current_tracks(&self) -> Vec<TrackView> {
         let all = self.unfiltered_tracks();
-        match &self.filter_hits {
-            Some(hits) => hits
-                .iter()
-                .filter_map(|h| all.get(h.index).cloned())
-                .collect(),
-            None => all,
-        }
+        self.view_indices()
+            .into_iter()
+            .filter_map(|i| all.get(i).cloned())
+            .collect()
     }
 
     pub fn unfiltered_len(&self) -> usize {
@@ -1302,12 +1554,10 @@ impl App {
                 SearchScope::Artists => self.results.artists.len(),
                 SearchScope::Playlists => self.results.playlists.len(),
             },
-            Tab::Library => match self.lib_section {
-                LibSection::Playlists => self.playlists.len(),
-                LibSection::Mixes => self.mixes.len(),
-                LibSection::ForYou => self.for_you.len(),
-            },
+            Tab::Home => self.for_you.len(),
             Tab::Mixes => self.mixes.len(),
+            Tab::Library => self.favorites.len(),
+            Tab::Playlists => self.playlists.len(),
             Tab::Favorites => match self.fav_section {
                 FavSection::Tracks => self.favorites.len(),
                 FavSection::Albums => self.fav_albums.len(),
@@ -1326,19 +1576,17 @@ impl App {
 
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
-        if tab == Tab::Mixes {
-            self.lib_section = LibSection::Mixes;
-        }
         self.nav.clear();
+        self.page_artist = None;
+        self.page_art = None;
+        self.focus = Focus::Main;
         self.clear_filter();
         self.select_first();
-    }
-
-    pub fn set_lib_section(&mut self, section: LibSection) {
-        self.set_tab(Tab::Library);
-        self.lib_section = section;
-        self.clear_filter();
-        self.select_first();
+        if tab == Tab::Queue {
+            if let Some(cur) = self.player.queue().cursor() {
+                self.list_state.select(Some(cur));
+            }
+        }
     }
 
     pub fn set_fav_section(&mut self, section: FavSection) {
@@ -1394,8 +1642,10 @@ impl App {
         }
         match self.tab {
             Tab::Search => format!("Search · {}", self.search_scope.title()),
-            Tab::Library => format!("Library · {}", self.lib_section.title()),
+            Tab::Home => "For You".into(),
             Tab::Mixes => "My Mixes".into(),
+            Tab::Library => "Library · Songs".into(),
+            Tab::Playlists => "Playlists".into(),
             Tab::Favorites => format!("Favorites · {}", self.fav_section.title()),
             Tab::Queue => "Queue".into(),
         }
@@ -1446,6 +1696,46 @@ fn track_haystack(track: &TrackView) -> String {
     match track.album.as_deref() {
         Some(album) if !album.is_empty() => format!("{} {} {}", track.title, track.artist, album),
         _ => format!("{} {}", track.title, track.artist),
+    }
+}
+
+fn cmp_tracks(a: Option<&TrackView>, b: Option<&TrackView>, key: SortKey) -> std::cmp::Ordering {
+    let Some(a) = a else {
+        return std::cmp::Ordering::Greater;
+    };
+    let Some(b) = b else {
+        return std::cmp::Ordering::Less;
+    };
+    match key {
+        SortKey::Title => a
+            .title
+            .to_ascii_lowercase()
+            .cmp(&b.title.to_ascii_lowercase()),
+        SortKey::Artist => a
+            .artist
+            .to_ascii_lowercase()
+            .cmp(&b.artist.to_ascii_lowercase())
+            .then_with(|| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            }),
+        SortKey::Album => a
+            .album
+            .clone()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .cmp(&b.album.clone().unwrap_or_default().to_ascii_lowercase())
+            .then_with(|| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            }),
+        SortKey::Time => a.duration_secs.cmp(&b.duration_secs).then_with(|| {
+            a.title
+                .to_ascii_lowercase()
+                .cmp(&b.title.to_ascii_lowercase())
+        }),
     }
 }
 

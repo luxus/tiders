@@ -135,6 +135,13 @@ pub struct Settings {
     pub show_spectrum: bool,
     /// Crossfade length in seconds (0 = gapless only).
     pub crossfade_secs: u8,
+    /// Whether the left navigation sidebar is visible.
+    #[serde(default = "default_true")]
+    pub sidebar_visible: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -149,6 +156,7 @@ impl Default for Settings {
             eq_theme: EqTheme::Tide,
             show_spectrum: true,
             crossfade_secs: 0,
+            sidebar_visible: true,
         }
     }
 }

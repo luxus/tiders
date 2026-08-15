@@ -199,10 +199,9 @@ impl MpvBackend {
     }
 
     fn spawn_vis(&mut self, gen: u64) {
-        // A second mpv decoding the same stream into a FIFO is expensive and
-        // was freezing the analyser. Opt in with TIDERS_PCM_VIS=1; otherwise
-        // the rustfft visualiser uses its synth fallback.
-        if std::env::var_os("TIDERS_PCM_VIS").is_none() {
+        // Second silent mpv dumps decoded PCM into a FIFO for the analyser.
+        // Disable with TIDERS_PCM_VIS=0 if the extra process is too heavy.
+        if !pcm_vis_enabled() {
             let _ = gen;
             return;
         }
@@ -492,6 +491,16 @@ fn unique_path(kind: &str, ext: &str) -> PathBuf {
     let n = IPC_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     std::env::temp_dir().join(format!("tiders-{kind}-{pid}-{n}.{ext}"))
+}
+
+fn pcm_vis_enabled() -> bool {
+    match std::env::var("TIDERS_PCM_VIS") {
+        Ok(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
 }
 
 #[cfg(unix)]

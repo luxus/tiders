@@ -339,6 +339,31 @@ impl Queue {
         }
         matches!(self.cursor, Some(i) if i > 0)
     }
+
+    /// The upcoming track without moving the cursor.
+    pub fn peek_next(&self) -> Option<&QueueItem> {
+        if self.items.is_empty() {
+            return None;
+        }
+        if self.repeat == RepeatMode::One {
+            return self.current();
+        }
+        if self.shuffle != ShuffleMode::Off && !self.order.is_empty() {
+            let pos = self.position_in_order().unwrap_or(0);
+            if pos + 1 < self.order.len() {
+                return self.items.get(self.order[pos + 1]);
+            }
+            if self.repeat == RepeatMode::All {
+                return self.order.first().and_then(|&i| self.items.get(i));
+            }
+            return None;
+        }
+        match self.cursor {
+            Some(i) if i + 1 < self.items.len() => self.items.get(i + 1),
+            Some(_) if self.repeat == RepeatMode::All => self.items.first(),
+            _ => None,
+        }
+    }
 }
 
 fn shuffle_indices(
@@ -443,6 +468,15 @@ mod tests {
         q.set_repeat(RepeatMode::All);
         assert_eq!(q.advance().map(|t| t.id), Some(1));
         assert_eq!(q.previous().map(|t| t.id), Some(2));
+    }
+
+    #[test]
+    fn peek_next_matches_advance() {
+        let mut q = Queue::from_tracks(vec![track(1), track(2), track(3)], 0);
+        assert_eq!(q.peek_next().map(|t| t.id), Some(2));
+        assert_eq!(q.current().map(|t| t.id), Some(1));
+        assert_eq!(q.advance().map(|t| t.id), Some(2));
+        assert_eq!(q.peek_next().map(|t| t.id), Some(3));
     }
 
     #[test]
