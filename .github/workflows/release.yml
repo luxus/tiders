@@ -60,7 +60,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          staging="${BIN}-${tag}-${{ matrix.target }}"
+          tag="${tag#refs/tags/}"
+          # Tag names may contain `/`; keep archive names as single path components.
+          safe_tag="${tag//\//-}"
+          staging="${BIN}-${safe_tag}-${{ matrix.target }}"
           mkdir -p "$staging" dist
           cp "target/${{ matrix.target }}/release/${BIN}" "$staging/"
           cp README.md LICENSE "$staging/"
