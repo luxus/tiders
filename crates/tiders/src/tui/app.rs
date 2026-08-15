@@ -203,6 +203,9 @@ pub struct App {
 
     pub input_mode: bool,
     pub input: String,
+    /// Ranked hits for the current `input` needle (FFF / neo_frizbee).
+    /// `None` means the needle is empty and the view is unfiltered.
+    filter_hits: Option<Vec<super::filter::Hit>>,
 
     pub results: SearchResults,
     pub favorites: Vec<TrackView>,
@@ -272,6 +275,7 @@ impl App {
             nav: Vec::new(),
             input_mode: false,
             input: String::new(),
+            filter_hits: None,
             results: SearchResults::default(),
             favorites: Vec::new(),
             fav_albums: Vec::new(),
@@ -488,6 +492,7 @@ impl App {
         self.load_favorites().await;
         self.load_playlists().await;
         self.load_home().await;
+        self.recompute_filter();
     }
 
     pub async fn load_favorites(&mut self) {
@@ -552,6 +557,9 @@ impl App {
                 self.results = results;
                 self.tab = Tab::Search;
                 self.nav.clear();
+                // Catalog already narrowed the list; show every hit.
+                self.input.clear();
+                self.filter_hits = None;
                 self.select_first();
             }
             Err(e) => self.set_status(format!("Search failed: {e}")),
@@ -567,34 +575,34 @@ impl App {
             Tab::Search => match self.search_scope {
                 SearchScope::Tracks => self.play_selected().await,
                 SearchScope::Albums => {
-                    if let Some(a) = self.results.albums.get(self.sel()).cloned() {
+                    if let Some(a) = self.results.albums.get(self.sel_orig()).cloned() {
                         self.open_album(a.id, a.title).await;
                     }
                 }
                 SearchScope::Artists => {
-                    if let Some(a) = self.results.artists.get(self.sel()).cloned() {
+                    if let Some(a) = self.results.artists.get(self.sel_orig()).cloned() {
                         self.open_artist(a.id, a.name).await;
                     }
                 }
                 SearchScope::Playlists => {
-                    if let Some(p) = self.results.playlists.get(self.sel()).cloned() {
+                    if let Some(p) = self.results.playlists.get(self.sel_orig()).cloned() {
                         self.open_playlist(p.uuid, p.title).await;
                     }
                 }
             },
             Tab::Library => match self.lib_section {
                 LibSection::Playlists => {
-                    if let Some(p) = self.playlists.get(self.sel()).cloned() {
+                    if let Some(p) = self.playlists.get(self.sel_orig()).cloned() {
                         self.open_playlist(p.uuid, p.title).await;
                     }
                 }
                 LibSection::Mixes => {
-                    if let Some(m) = self.mixes.get(self.sel()).cloned() {
+                    if let Some(m) = self.mixes.get(self.sel_orig()).cloned() {
                         self.open_mix(m.id, m.title).await;
                     }
                 }
                 LibSection::ForYou => {
-                    if let Some(c) = self.for_you.get(self.sel()).cloned() {
+                    if let Some(c) = self.for_you.get(self.sel_orig()).cloned() {
                         self.open_card(c).await;
                     }
                 }
@@ -602,12 +610,12 @@ impl App {
             Tab::Favorites => match self.fav_section {
                 FavSection::Tracks => self.play_selected().await,
                 FavSection::Albums => {
-                    if let Some(a) = self.fav_albums.get(self.sel()).cloned() {
+                    if let Some(a) = self.fav_albums.get(self.sel_orig()).cloned() {
                         self.open_album(a.id, a.title).await;
                     }
                 }
                 FavSection::Artists => {
-                    if let Some(a) = self.fav_artists.get(self.sel()).cloned() {
+                    if let Some(a) = self.fav_artists.get(self.sel_orig()).cloned() {
                         self.open_artist(a.id, a.name).await;
                     }
                 }
@@ -636,6 +644,7 @@ impl App {
             Ok(tracks) => {
                 self.page_tracks = tracks;
                 self.nav.push(Page::Playlist { uuid, title });
+                self.clear_filter();
                 self.select_first();
             }
             Err(e) => self.set_status(format!("Playlist: {e}")),
@@ -653,6 +662,7 @@ impl App {
             Ok(tracks) => {
                 self.page_tracks = tracks;
                 self.nav.push(Page::Mix { id, title });
+                self.clear_filter();
                 self.select_first();
             }
             Err(e) => self.set_status(format!("Mix: {e}")),
@@ -670,6 +680,7 @@ impl App {
             Ok(tracks) => {
                 self.page_tracks = tracks;
                 self.nav.push(Page::Album { id, title });
+                self.clear_filter();
                 self.select_first();
             }
             Err(e) => self.set_status(format!("Album: {e}")),
@@ -691,6 +702,7 @@ impl App {
                 self.page_albums = albums.unwrap_or_default();
                 self.page_bio = bio.unwrap_or_default();
                 self.nav.push(Page::Artist { id, name });
+                self.clear_filter();
                 self.select_first();
             }
             Err(e) => self.set_status(format!("Artist: {e}")),
@@ -715,6 +727,7 @@ impl App {
             self.page_tracks.clear();
             self.page_albums.clear();
             self.page_bio.clear();
+            self.recompute_filter();
             self.select_first();
             return true;
         }
@@ -722,13 +735,18 @@ impl App {
     }
 
     pub async fn play_selected(&mut self) {
-        let (tracks, idx) = self.current_tracks_with_selection();
+        let tracks = self.unfiltered_tracks();
         if tracks.is_empty() {
             return;
         }
-        self.player.set_queue(tracks, idx);
-        self.player
-            .set_shuffle(self.settings.shuffle, Some(&self.counts));
+        let orig = self.sel_orig().min(tracks.len().saturating_sub(1));
+        if self.tab == Tab::Queue && self.nav.is_empty() {
+            let _ = self.player.select(orig);
+        } else {
+            self.player.set_queue(tracks, orig);
+            self.player
+                .set_shuffle(self.settings.shuffle, Some(&self.counts));
+        }
         self.persist_queue();
         self.play_current().await;
     }
@@ -1057,6 +1075,101 @@ impl App {
         self.list_state.selected().unwrap_or(0)
     }
 
+    /// Map a filtered row index back onto the unfiltered source list.
+    pub fn orig_at(&self, filtered: usize) -> usize {
+        self.filter_hits
+            .as_ref()
+            .and_then(|hits| hits.get(filtered))
+            .map(|h| h.index)
+            .unwrap_or(filtered)
+    }
+
+    /// Map the highlighted (filtered) row back onto the unfiltered source list.
+    fn sel_orig(&self) -> usize {
+        self.orig_at(self.sel())
+    }
+
+    pub fn filter_active(&self) -> bool {
+        self.filter_hits.is_some()
+    }
+
+    pub fn hit_at(&self, filtered_index: usize) -> Option<&super::filter::Hit> {
+        self.filter_hits.as_ref()?.get(filtered_index)
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.input.clear();
+        self.filter_hits = None;
+    }
+
+    /// Re-rank the visible corpus against `self.input` (FFF / neo_frizbee).
+    pub fn recompute_filter(&mut self) {
+        let needle = self.input.trim();
+        if needle.is_empty() {
+            self.filter_hits = None;
+            return;
+        }
+        let hay = self.collect_haystacks();
+        self.filter_hits = Some(super::filter::rank(needle, &hay));
+    }
+
+    fn collect_haystacks(&self) -> Vec<String> {
+        if !self.nav.is_empty() {
+            return self.page_tracks.iter().map(track_haystack).collect();
+        }
+        match self.tab {
+            Tab::Search => match self.search_scope {
+                SearchScope::Tracks => self.results.tracks.iter().map(track_haystack).collect(),
+                SearchScope::Albums => self
+                    .results
+                    .albums
+                    .iter()
+                    .map(|a| format!("{} {}", a.title, a.artist))
+                    .collect(),
+                SearchScope::Artists => self.results.artists.iter().map(|a| a.name.clone()).collect(),
+                SearchScope::Playlists => self
+                    .results
+                    .playlists
+                    .iter()
+                    .map(|p| format!("{} {}", p.title, p.description.clone().unwrap_or_default()))
+                    .collect(),
+            },
+            Tab::Library => match self.lib_section {
+                LibSection::Playlists => self
+                    .playlists
+                    .iter()
+                    .map(|p| format!("{} {}", p.title, p.description.clone().unwrap_or_default()))
+                    .collect(),
+                LibSection::Mixes => self
+                    .mixes
+                    .iter()
+                    .map(|m| format!("{} {}", m.title, m.subtitle))
+                    .collect(),
+                LibSection::ForYou => self
+                    .for_you
+                    .iter()
+                    .map(|c| format!("{} {}", c.title, c.subtitle))
+                    .collect(),
+            },
+            Tab::Favorites => match self.fav_section {
+                FavSection::Tracks => self.favorites.iter().map(track_haystack).collect(),
+                FavSection::Albums => self
+                    .fav_albums
+                    .iter()
+                    .map(|a| format!("{} {}", a.title, a.artist))
+                    .collect(),
+                FavSection::Artists => self.fav_artists.iter().map(|a| a.name.clone()).collect(),
+            },
+            Tab::Queue => self
+                .player
+                .queue()
+                .items()
+                .iter()
+                .map(track_haystack)
+                .collect(),
+        }
+    }
+
     pub fn selected_track(&self) -> Option<TrackView> {
         let (tracks, idx) = self.current_tracks_with_selection();
         tracks.get(idx).cloned()
@@ -1079,7 +1192,7 @@ impl App {
             || (self.tab == Tab::Search && self.search_scope == SearchScope::Tracks)
     }
 
-    pub fn current_tracks(&self) -> Vec<TrackView> {
+    pub fn unfiltered_tracks(&self) -> Vec<TrackView> {
         if !self.nav.is_empty() {
             return self.page_tracks.clone();
         }
@@ -1091,7 +1204,18 @@ impl App {
         }
     }
 
-    pub fn current_len(&self) -> usize {
+    pub fn current_tracks(&self) -> Vec<TrackView> {
+        let all = self.unfiltered_tracks();
+        match &self.filter_hits {
+            Some(hits) => hits
+                .iter()
+                .filter_map(|h| all.get(h.index).cloned())
+                .collect(),
+            None => all,
+        }
+    }
+
+    pub fn unfiltered_len(&self) -> usize {
         if !self.nav.is_empty() {
             return self.page_tracks.len();
         }
@@ -1116,9 +1240,17 @@ impl App {
         }
     }
 
+    pub fn current_len(&self) -> usize {
+        self.filter_hits
+            .as_ref()
+            .map(|h| h.len())
+            .unwrap_or_else(|| self.unfiltered_len())
+    }
+
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.nav.clear();
+        self.clear_filter();
         self.select_first();
     }
 
@@ -1187,6 +1319,13 @@ impl App {
     pub fn quit(&mut self) {
         self.persist_queue();
         self.should_quit = true;
+    }
+}
+
+fn track_haystack(track: &TrackView) -> String {
+    match track.album.as_deref() {
+        Some(album) if !album.is_empty() => format!("{} {} {}", track.title, track.artist, album),
+        _ => format!("{} {}", track.title, track.artist),
     }
 }
 

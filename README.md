@@ -25,6 +25,11 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
   [ratatui](https://ratatui.rs)) with search, library, favorites, a play queue,
   and a now‑playing stage. Visual design and the **120 Hz** frame loop take cues
   from [xai-org/grok-build](https://github.com/xai-org/grok-build).
+- **Live filter** — `/` fuzzy-filters the current view (library, mixes, playlists,
+  favorites, queue, album tracks) with the SIMD matcher from
+  [FFF](https://github.com/dmtrKovalenko/fff) (`neo_frizbee`). Typo-resistant,
+  ranked as you type, with match highlighting. On the Search tab, **Enter** still
+  queries the TIDAL catalog.
 - **Library** — your playlists, **My Mixes**, and TIDAL **For You** cards, plus
   album / artist / playlist drill‑down (bio included).
 - **Favorites** — saved tracks, albums, and artists; love / unlove syncs with
@@ -130,7 +135,7 @@ library. Keys:
 
 | Key | Action |
 |-----|--------|
-| `/` | search |
+| `/` | live-filter the current list (playlists, mixes, favorites, queue, …). On Search, **Enter** also queries the TIDAL catalog |
 | `Tab` / `1` `2` `3` `4` | Search · Library · Favorites · Queue |
 | `t` | cycle search scope (tracks / albums / artists / playlists) |
 | `S` | cycle Library or Favorites section |
@@ -207,6 +212,8 @@ output.
 - [tidlers](https://codeberg.org/tomkoid/tidlers) — the TIDAL API client.
 - [ratatui](https://ratatui.rs) and [xai-org/grok-build](https://github.com/xai-org/grok-build)
   — TUI framework and 120 Hz / animation inspiration.
+- [FFF](https://github.com/dmtrKovalenko/fff) / [neo_frizbee](https://crates.io/crates/neo_frizbee)
+  — SIMD fuzzy matching for in-list filtering.
 - [mpv](https://mpv.io) — the playback engine.
 - [rustfft](https://crates.io/crates/rustfft) — the spectrum analyser.
 

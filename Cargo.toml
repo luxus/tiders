@@ -26,6 +26,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 rustfft = "6"
+# SIMD fuzzy matcher used by FFF (https://github.com/dmtrKovalenko/fff).
+neo_frizbee = "0.11"
 
 [profile.release]
 strip = true

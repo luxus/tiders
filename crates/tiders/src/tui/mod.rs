@@ -3,6 +3,7 @@
 mod anim;
 mod app;
 mod art;
+mod filter;
 mod theme;
 mod ui;
 
@@ -184,14 +185,41 @@ fn handle_popup_key(app: &mut App, key: KeyEvent) {
 async fn handle_browse_key(app: &mut App, key: KeyEvent) {
     if app.input_mode {
         match key.code {
-            KeyCode::Enter => app.submit_search().await,
+            KeyCode::Enter => {
+                if app.tab == Tab::Search && app.nav.is_empty() && !app.input.trim().is_empty() {
+                    app.submit_search().await;
+                } else {
+                    app.input_mode = false;
+                    app.activate().await;
+                }
+            }
             KeyCode::Esc => {
-                app.input_mode = false;
+                if !app.input.is_empty() {
+                    app.clear_filter();
+                    app.select_first();
+                } else {
+                    app.input_mode = false;
+                }
             }
             KeyCode::Backspace => {
                 app.input.pop();
+                app.recompute_filter();
+                app.select_first();
             }
-            KeyCode::Char(c) => app.input.push(c),
+            KeyCode::Up => app.move_selection(-1),
+            KeyCode::Down => app.move_selection(1),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.clear_filter();
+                app.select_first();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                app.input.push(c);
+                app.recompute_filter();
+                app.select_first();
+            }
             _ => {}
         }
         return;
@@ -199,7 +227,10 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => {
-            if !app.go_back() {
+            if app.filter_active() {
+                app.clear_filter();
+                app.select_first();
+            } else if !app.go_back() {
                 app.quit();
             }
         }
@@ -208,7 +239,6 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => app.open_detail().await,
         KeyCode::Char('Q') => app.open_quality(),
         KeyCode::Char('/') | KeyCode::Char('i') => {
-            app.input.clear();
             app.input_mode = true;
         }
         KeyCode::Tab => {
@@ -223,6 +253,7 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('t') => {
             if app.tab == Tab::Search && app.nav.is_empty() {
                 app.search_scope = app.search_scope.cycle();
+                app.recompute_filter();
                 app.select_first();
             }
         }
@@ -231,10 +262,12 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
                 match app.tab {
                     Tab::Library => {
                         app.lib_section = app.lib_section.cycle();
+                        app.recompute_filter();
                         app.select_first();
                     }
                     Tab::Favorites => {
                         app.fav_section = app.fav_section.cycle();
+                        app.recompute_filter();
                         app.select_first();
                     }
                     _ => {}
