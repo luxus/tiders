@@ -25,6 +25,14 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
   [ratatui](https://ratatui.rs)) with search, favorites, a play queue, and a
   now‑playing bar. Visual design takes cues from
   [xai-org/grok-build](https://github.com/xai-org/grok-build).
+- **Inline album art** — cover art rendered right in the terminal via
+  [ratatui-image](https://crates.io/crates/ratatui-image): the native graphics
+  protocol on kitty/sixel/iTerm2, with a **unicode half‑block** fallback that
+  works in any truecolor terminal.
+- **Modals & animation** — a Help overlay, a Track‑Details popup (with cover
+  art), and a Quality selector, all with an open animation; plus a scrolling
+  marquee title, a gradient spectrum, a live progress bar, fade‑out toasts, and
+  loading spinners.
 - **Scriptable CLI** — `login`, `search`, `play`, `favorites`, `playlists`,
   `whoami`, `logout` for pipelines and quick one‑offs.
 - **Secure device‑code login** — the standard TIDAL OAuth device flow; the
@@ -109,8 +117,11 @@ library. Keys:
 | `Space` | play / pause |
 | `n` / `p` | next / previous |
 | `+` / `-` | volume |
+| `d` | track details (with cover art) |
+| `Q` | change audio quality |
 | `f` | (re)load favorites |
 | `s` | stop |
+| `?` | help |
 | `q` | quit |
 
 ### CLI
@@ -138,6 +149,10 @@ Global flags: `--quality low|high|lossless|hires` and `--config-dir <DIR>`
 
 `<config>` is `~/.config` on Linux and `~/Library/Application Support` on macOS,
 overridable with `--config-dir` or the `TIDERS_CONFIG_DIR` environment variable.
+
+Album art auto‑detects the terminal's image protocol; force one with
+`TIDERS_IMAGE_PROTOCOL=halfblocks|sixel|kitty|iterm2` (half‑blocks works
+everywhere).
 
 For headless/CI use, a full session JSON can be supplied via the
 `TIDAL_SESSION_JSON` environment variable; Tiders restores and persists it on

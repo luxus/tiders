@@ -1,6 +1,7 @@
 //! The interactive terminal UI.
 
 mod app;
+mod art;
 mod theme;
 mod ui;
 
@@ -20,11 +21,14 @@ use ratatui::Terminal;
 
 use tiders_core::config::Config;
 
-use app::{Screen, View};
+use app::{Popup, Screen, View};
+use art::ArtManager;
 
 /// Launch the TUI against the given config, restoring the terminal on exit.
 pub async fn run(config: Config) -> Result<()> {
-    let mut app = App::bootstrap(config).await?;
+    // Detect terminal image capability BEFORE touching the alternate screen.
+    let art = ArtManager::new();
+    let mut app = App::bootstrap(config, art).await?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -34,7 +38,6 @@ pub async fn run(config: Config) -> Result<()> {
 
     let result = event_loop(&mut terminal, &mut app).await;
 
-    // Always restore the terminal, even if the loop errored.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -49,10 +52,8 @@ async fn event_loop<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        // Poll for an input event with a short timeout so the UI keeps ticking
-        // (spinner animation, login progress, queue auto-advance).
         let maybe_event = tokio::task::block_in_place(|| -> Result<Option<Event>> {
-            if event::poll(Duration::from_millis(120))? {
+            if event::poll(Duration::from_millis(100))? {
                 Ok(Some(event::read()?))
             } else {
                 Ok(None)
@@ -75,7 +76,6 @@ async fn event_loop<B: ratatui::backend::Backend>(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) {
-    // Ctrl-C always quits.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.quit();
         return;
@@ -83,7 +83,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
 
     match app.screen {
         Screen::Login => handle_login_key(app, key),
-        Screen::Browse => handle_browse_key(app, key).await,
+        Screen::Browse => {
+            if app.popup_open() {
+                handle_popup_key(app, key);
+            } else {
+                handle_browse_key(app, key).await;
+            }
+        }
     }
 }
 
@@ -93,6 +99,31 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('o') => app.open_login_url(),
         KeyCode::Char('r') => app.start_login(),
         _ => {}
+    }
+}
+
+fn handle_popup_key(app: &mut App, key: KeyEvent) {
+    match &app.popup {
+        Some(Popup::Quality) => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.quality_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.quality_move(1),
+            KeyCode::Enter => app.apply_quality(),
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => app.close_popup(),
+            _ => {}
+        },
+        _ => {
+            // Help / Detail: any of these dismiss.
+            if matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('?')
+                    | KeyCode::Char('d')
+            ) {
+                app.close_popup();
+            }
+        }
     }
 }
 
@@ -112,6 +143,9 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.quit(),
+        KeyCode::Char('?') => app.toggle_help(),
+        KeyCode::Char('d') => app.open_detail().await,
+        KeyCode::Char('Q') => app.open_quality(),
         KeyCode::Char('/') | KeyCode::Char('i') => {
             app.input.clear();
             app.input_mode = true;

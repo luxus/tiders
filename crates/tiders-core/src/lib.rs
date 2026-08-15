@@ -25,6 +25,7 @@
 pub mod config;
 pub mod error;
 pub mod format;
+pub mod images;
 pub mod model;
 pub mod player;
 pub mod queue;

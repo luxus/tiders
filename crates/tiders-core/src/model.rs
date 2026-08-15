@@ -17,6 +17,8 @@ pub struct TrackView {
     pub album: Option<String>,
     pub duration_secs: u64,
     pub explicit: bool,
+    /// TIDAL cover-art id (dashes); resolve with [`TrackView::cover_url`].
+    pub cover: Option<String>,
 }
 
 impl TrackView {
@@ -28,6 +30,13 @@ impl TrackView {
     /// `M:SS` duration string.
     pub fn duration(&self) -> String {
         format::duration(self.duration_secs)
+    }
+
+    /// Public cover-art URL at `size`×`size` (e.g. 80, 160, 320, 640, 1280).
+    pub fn cover_url(&self, size: u32) -> Option<String> {
+        self.cover
+            .as_deref()
+            .map(|id| crate::images::cover_url(id, size))
     }
 }
 
@@ -45,6 +54,7 @@ impl From<&tidlers::client::models::track::Track> for TrackView {
             album: t.album.as_ref().map(|a| a.title.clone()),
             duration_secs: t.duration,
             explicit: t.explicit,
+            cover: t.album.as_ref().and_then(|a| a.cover.clone()),
         }
     }
 }
@@ -65,6 +75,7 @@ impl From<&tidlers::client::models::search::SearchTrackHit> for TrackView {
             album: h.album.as_ref().map(|a| a.title.clone()),
             duration_secs: h.duration,
             explicit: h.explicit,
+            cover: h.album.as_ref().map(|a| a.cover.clone()),
         }
     }
 }
@@ -178,6 +189,7 @@ mod tests {
             album: Some("Discovery".into()),
             duration_secs: 301,
             explicit: false,
+            cover: None,
         };
         assert_eq!(tv.label(), "Daft Punk — Digital Love");
         assert_eq!(tv.duration(), "5:01");

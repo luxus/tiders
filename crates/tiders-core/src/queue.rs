@@ -129,6 +129,7 @@ mod tests {
             album: None,
             duration_secs: 100,
             explicit: false,
+            cover: None,
         }
     }
 

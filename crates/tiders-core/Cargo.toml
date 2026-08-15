@@ -16,6 +16,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
 tracing.workspace = true
+# Public cover-art fetches from resources.tidal.com (no auth needed).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

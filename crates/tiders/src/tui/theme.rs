@@ -67,3 +67,24 @@ pub fn selected() -> Style {
         .bg(HIGHLIGHT_BG)
         .add_modifier(Modifier::BOLD)
 }
+
+/// Linearly blend two colors; `t` in `0.0..=1.0` (0 = `a`, 1 = `b`).
+///
+/// Non-RGB colors are returned as-is at the extremes so callers always get a
+/// sensible value even on limited terminals.
+pub fn blend(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+        }
+        _ => {
+            if t < 0.5 {
+                a
+            } else {
+                b
+            }
+        }
+    }
+}

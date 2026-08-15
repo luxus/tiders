@@ -266,6 +266,7 @@ mod tests {
             album: Some("Album".into()),
             duration_secs: 200,
             explicit: false,
+            cover: None,
         }
     }
 
