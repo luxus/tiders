@@ -85,6 +85,74 @@ is the same seam the desktop version would use.
 `mpv` is only needed at runtime for actual audio; everything else (login,
 search, browsing) works without it.
 
+### GitHub Releases
+
+Tagged versions (`vX.Y.Z`) publish Linux and macOS binaries via GitHub Actions.
+Grab the archive for your platform from
+[Releases](https://github.com/luxus/tiders/releases) and unpack the `tiders`
+binary onto your `PATH`.
+
+```sh
+# after extracting, e.g.
+mkdir -p ~/.local/bin
+install -m 755 tiders ~/.local/bin/tiders
+```
+
+### Nix
+
+Needs [Nix](https://nixos.org/download/) with flakes (`nix-command` + `flakes`).
+`mpv` is wrapped onto the packaged binary's `PATH`, so you do not need to
+install it yourself.
+
+**Run without installing** (builds into the Nix store; nothing is added to your
+profile or system):
+
+```sh
+# from GitHub — launches the interactive TUI
+nix run github:luxus/tiders
+
+# CLI subcommands: everything after `--` is passed to tiders
+nix run github:luxus/tiders -- --help
+nix run github:luxus/tiders -- login
+nix run github:luxus/tiders -- search daft punk
+```
+
+From a local checkout of this repo:
+
+```sh
+nix run .                 # TUI
+nix run . -- --help
+nix build                 # ./result/bin/tiders
+nix flake check           # build + cargo tests + CLI smoke test
+nix develop               # rustc/cargo/clippy/rustfmt + mpv
+```
+
+**Install via overlay** (NixOS / home-manager / nix-darwin). Apply the overlay
+with the `nixpkgs.overlays` module option — `nixosSystem` does not take an
+`overlays` argument:
+
+```nix
+# flake.nix
+{
+  inputs.tiders.url = "github:luxus/tiders";
+
+  outputs = { nixpkgs, tiders, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ({ pkgs, ... }: {
+          nixpkgs.overlays = [ tiders.overlays.default ];
+          environment.systemPackages = [ pkgs.tiders ];
+        })
+      ];
+    };
+  };
+}
+```
+
+home-manager is the same idea: `nixpkgs.overlays = [ tiders.overlays.default ];`
+then `home.packages = [ pkgs.tiders ];`.
+
 ### Build
 
 ```sh
@@ -102,6 +170,12 @@ cargo build --release
 tiders            # launches the interactive UI (default)
 # or explicitly:
 tiders tui
+```
+
+Without installing Tiders, the same TUI is:
+
+```sh
+nix run github:luxus/tiders
 ```
 
 If you are not signed in, the TUI shows a **device‑login** screen with a URL and
