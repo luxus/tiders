@@ -1723,12 +1723,17 @@ fn centered_pct(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
     centered_rect(w, h, area)
 }
 
-/// Top-right toast slot, with a one-cell margin from the edges.
+/// Top-right toast slot, with a one-cell margin from the edges of `full`.
 fn toast_rect(full: Rect, w: u16, h: u16) -> Option<Rect> {
     if full.width < w + 4 || full.height < h + 3 {
         return None;
     }
-    Some(Rect::new(full.width.saturating_sub(w + 3), 1, w, h))
+    Some(Rect::new(
+        full.x + full.width.saturating_sub(w + 3),
+        full.y.saturating_add(1),
+        w,
+        h,
+    ))
 }
 
 #[cfg(test)]
@@ -1743,5 +1748,12 @@ mod tests {
         assert_eq!(area.y, 1);
         assert_eq!(area.width, 20);
         assert_eq!(area.height, 4);
+    }
+
+    #[test]
+    fn toast_honours_frame_origin() {
+        let area = toast_rect(Rect::new(10, 5, 80, 24), 20, 4).unwrap();
+        assert_eq!(area.x, 67);
+        assert_eq!(area.y, 6);
     }
 }

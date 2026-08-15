@@ -353,20 +353,23 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
     if matches!(app.popup, Some(Popup::Context(_))) {
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
-                match app.hits.at(mouse.column, mouse.row) {
-                    Some(Hit::ContextItem(i)) => {
-                        if let Some(Popup::Context(menu)) = app.popup.as_mut() {
-                            menu.cursor = i;
-                        }
-                        app.context_activate().await;
+            MouseEventKind::Down(MouseButton::Left) => match app.hits.at(mouse.column, mouse.row) {
+                Some(Hit::ContextItem(i)) => {
+                    if let Some(Popup::Context(menu)) = app.popup.as_mut() {
+                        menu.cursor = i;
                     }
-                    Some(Hit::ContextChrome) => {}
-                    _ => {
-                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                            app.close_popup();
-                        }
+                }
+                Some(Hit::ContextChrome) => {}
+                _ => app.close_popup(),
+            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Activate on release so a Down+Up pair cannot run the action
+                // twice. Terminals that only send Up still get a click path.
+                if let Some(Hit::ContextItem(i)) = app.hits.at(mouse.column, mouse.row) {
+                    if let Some(Popup::Context(menu)) = app.popup.as_mut() {
+                        menu.cursor = i;
                     }
+                    app.context_activate().await;
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => app.close_popup(),
