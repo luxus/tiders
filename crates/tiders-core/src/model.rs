@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::format;
 
 /// A track reduced to what a list row and the now-playing bar need.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TrackView {
     pub id: u64,
     pub title: String,
@@ -26,25 +26,6 @@ pub struct TrackView {
     pub artist_id: Option<u64>,
     /// Mix id for "radio from this track", if TIDAL supplied one.
     pub mix_id: Option<String>,
-}
-
-impl Default for TrackView {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            title: String::new(),
-            artist: String::new(),
-            album: None,
-            duration_secs: 0,
-            explicit: false,
-            cover: None,
-            audio_quality: None,
-            bpm: None,
-            album_id: None,
-            artist_id: None,
-            mix_id: None,
-        }
-    }
 }
 
 impl TrackView {

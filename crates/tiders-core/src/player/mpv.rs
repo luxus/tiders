@@ -171,7 +171,12 @@ impl MpvBackend {
         }
 
         let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
-        spawn_observer(self.ipc_path.clone(), Arc::clone(&self.live), Arc::clone(&self.gen), gen);
+        spawn_observer(
+            self.ipc_path.clone(),
+            Arc::clone(&self.live),
+            Arc::clone(&self.gen),
+            gen,
+        );
         self.spawn_vis(gen);
         Ok(())
     }
@@ -248,7 +253,9 @@ impl MpvBackend {
             let _ = vis.wait();
         }
         // Unblock a reader stuck on `open(fifo)` by briefly opening it for write.
-        let _ = std::fs::OpenOptions::new().write(true).open(&self.fifo_path);
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.fifo_path);
         let _ = std::fs::remove_file(&self.vis_ipc);
         let _ = std::fs::remove_file(&self.fifo_path);
         self.gen.fetch_add(1, Ordering::SeqCst);
@@ -317,11 +324,7 @@ impl AudioBackend for MpvBackend {
     fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.volume = volume.min(100);
         if self.child.is_some() {
-            let _ = self.send_command(&serde_json::json!([
-                "set_property",
-                "volume",
-                self.volume
-            ]));
+            let _ = self.send_command(&serde_json::json!(["set_property", "volume", self.volume]));
         }
         Ok(())
     }
@@ -400,7 +403,8 @@ impl AudioBackend for MpvBackend {
             mime_type: None,
             codecs: codec,
             sample_rate_hz: samplerate,
-            bit_depth: bit_depth.or_else(|| format.as_deref().and_then(format::bit_depth_from_format)),
+            bit_depth: bit_depth
+                .or_else(|| format.as_deref().and_then(format::bit_depth_from_format)),
             channels,
             bitrate_bps: bitrate,
         }
@@ -574,12 +578,16 @@ fn apply_ipc_event(live: &Live, v: &serde_json::Value) {
             }
         }
         "eof-reached" => {
-            live.eof
-                .store(data.and_then(|d| d.as_bool()).unwrap_or(false), Ordering::Relaxed);
+            live.eof.store(
+                data.and_then(|d| d.as_bool()).unwrap_or(false),
+                Ordering::Relaxed,
+            );
         }
         "idle-active" => {
-            live.idle
-                .store(data.and_then(|d| d.as_bool()).unwrap_or(false), Ordering::Relaxed);
+            live.idle.store(
+                data.and_then(|d| d.as_bool()).unwrap_or(false),
+                Ordering::Relaxed,
+            );
         }
         "audio-codec-name" => {
             if let Ok(mut g) = live.codec.lock() {

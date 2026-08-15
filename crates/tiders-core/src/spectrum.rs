@@ -65,9 +65,24 @@ impl EqTheme {
             EqTheme::Classic => [(0, 130, 0), (0, 210, 0), (210, 210, 0), (210, 55, 55)],
             EqTheme::Fire => [(170, 35, 0), (215, 95, 0), (230, 175, 0), (250, 235, 90)],
             EqTheme::Ice => [(0, 55, 150), (0, 135, 215), (55, 205, 225), (195, 235, 255)],
-            EqTheme::Mono => [(55, 55, 55), (105, 105, 105), (160, 160, 160), (215, 215, 215)],
-            EqTheme::Neon => [(150, 0, 195), (215, 0, 175), (250, 75, 195), (250, 195, 235)],
-            EqTheme::Tide => [(13, 90, 110), (45, 212, 191), (125, 207, 255), (158, 206, 106)],
+            EqTheme::Mono => [
+                (55, 55, 55),
+                (105, 105, 105),
+                (160, 160, 160),
+                (215, 215, 215),
+            ],
+            EqTheme::Neon => [
+                (150, 0, 195),
+                (215, 0, 175),
+                (250, 75, 195),
+                (250, 195, 235),
+            ],
+            EqTheme::Tide => [
+                (13, 90, 110),
+                (45, 212, 191),
+                (125, 207, 255),
+                (158, 206, 106),
+            ],
         }
     }
 }
@@ -236,7 +251,11 @@ impl Spectrum {
                 s += env * (2.0 * PI * f * t).sin();
             }
             // Filtered noise (hash) for high-band shimmer.
-            let n = hash01(self.seed.wrapping_add(i as u64).wrapping_add((t0 * 100.0) as u64));
+            let n = hash01(
+                self.seed
+                    .wrapping_add(i as u64)
+                    .wrapping_add((t0 * 100.0) as u64),
+            );
             s += (n - 0.5) * 0.18;
             // Kick thump.
             s += kick * (2.0 * PI * 55.0 * t).sin() * 0.7;
@@ -356,7 +375,7 @@ pub fn render_rows(frame: &SpectrumFrame, height: u16) -> Vec<Vec<(char, f32)>> 
     let mut rows = vec![vec![(' ', 0.0); frame.bars.len()]; h];
     for (x, (&bar, &peak)) in frame.bars.iter().zip(frame.peaks.iter()).enumerate() {
         let filled = bar * h as f32;
-        for y in 0..h {
+        for (y, row) in rows.iter_mut().enumerate() {
             // y=0 is the top row.
             let from_bottom = (h - 1 - y) as f32;
             let cell = filled - from_bottom;
@@ -368,10 +387,12 @@ pub fn render_rows(frame: &SpectrumFrame, height: u16) -> Vec<Vec<(char, f32)>> 
                 GLYPHS[0]
             };
             let t = ((from_bottom + 0.5) / h as f32).clamp(0.0, 1.0);
-            rows[y][x] = (glyph, t);
+            row[x] = (glyph, t);
         }
         // Peak cap: a `•` on the row matching the peak.
-        let peak_row = h.saturating_sub(1).saturating_sub((peak * h as f32).floor() as usize);
+        let peak_row = h
+            .saturating_sub(1)
+            .saturating_sub((peak * h as f32).floor() as usize);
         if peak > 0.02 && peak_row < h && rows[peak_row][x].0 == ' ' {
             rows[peak_row][x] = ('•', (1.0 - peak_row as f32 / h as f32).clamp(0.0, 1.0));
         }
@@ -402,11 +423,15 @@ mod tests {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .unwrap();
         assert!(
-            idx >= 4 && idx < 24,
+            (4..24).contains(&idx),
             "440 Hz peak at unexpected band {idx}: {:?}",
             frame.bars
         );
-        assert!(frame.bars[idx] > 0.15, "peak too quiet: {}", frame.bars[idx]);
+        assert!(
+            frame.bars[idx] > 0.15,
+            "peak too quiet: {}",
+            frame.bars[idx]
+        );
     }
 
     #[test]

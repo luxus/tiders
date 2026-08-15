@@ -262,7 +262,11 @@ impl TidalService {
                 Some(OrderDirection::Ascending),
             )
             .await?;
-        Ok(response.items.iter().map(|e| TrackView::from(&e.item)).collect())
+        Ok(response
+            .items
+            .iter()
+            .map(|e| TrackView::from(&e.item))
+            .collect())
     }
 
     /// Tracks in a TIDAL mix.
@@ -378,7 +382,11 @@ impl TidalService {
             .client
             .get_collection_album_favorites(Some(limit), Some(offset))
             .await?;
-        Ok(response.items.iter().map(|e| AlbumView::from(&e.item)).collect())
+        Ok(response
+            .items
+            .iter()
+            .map(|e| AlbumView::from(&e.item))
+            .collect())
     }
 
     /// Favorite / followed artists.
@@ -464,10 +472,17 @@ impl TidalService {
             ..StreamQuality::default()
         };
         // Typical defaults when the decoder hasn't reported yet.
-        if quality.codecs.as_deref().is_some_and(|c| c.contains("flac"))
+        if quality
+            .codecs
+            .as_deref()
+            .is_some_and(|c| c.contains("flac"))
             && quality.sample_rate_hz.is_none()
         {
-            if playback.audio_quality.to_ascii_uppercase().contains("HI_RES") {
+            if playback
+                .audio_quality
+                .to_ascii_uppercase()
+                .contains("HI_RES")
+            {
                 quality.bit_depth = Some(24);
             } else {
                 quality.bit_depth = Some(16);
@@ -502,12 +517,10 @@ fn strip_simple_html(s: String) -> String {
             tag.push(t);
         }
         let name = tag
-            .trim()
-            .trim_end_matches('/')
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or("")
+            .trim_end_matches('/')
             .to_ascii_lowercase();
         if name == "br" {
             out.push('\n');
@@ -591,11 +604,7 @@ fn push_mix(
         .text
         .clone()
         .unwrap_or_else(|| "Mix".into());
-    let subtitle = data
-        .subtitle_text_info
-        .text
-        .clone()
-        .unwrap_or_default();
+    let subtitle = data.subtitle_text_info.text.clone().unwrap_or_default();
     let cover_url = data.mix_images.first().map(|i| i.url.clone());
     mixes.push(MixView {
         id: data.id.clone(),
@@ -612,7 +621,10 @@ fn push_mix(
     });
 }
 
-fn push_playlist(data: &tidlers::client::models::home::HomePlaylistData, cards: &mut Vec<HomeCard>) {
+fn push_playlist(
+    data: &tidlers::client::models::home::HomePlaylistData,
+    cards: &mut Vec<HomeCard>,
+) {
     cards.push(HomeCard {
         title: data.title.clone(),
         subtitle: format!("{} tracks", data.number_of_tracks),
@@ -698,17 +710,8 @@ mod tests {
             strip_simple_html("Verse one<br/>Verse two".into()),
             "Verse one\nVerse two"
         );
-        assert_eq!(
-            strip_simple_html("a<br>b<br />c".into()),
-            "a\nb\nc"
-        );
-        assert_eq!(
-            strip_simple_html("<p>hi &amp; lo</p>".into()),
-            "hi & lo"
-        );
-        assert_eq!(
-            strip_simple_html("a<br class=\"x\">b".into()),
-            "a\nb"
-        );
+        assert_eq!(strip_simple_html("a<br>b<br />c".into()), "a\nb\nc");
+        assert_eq!(strip_simple_html("<p>hi &amp; lo</p>".into()), "hi & lo");
+        assert_eq!(strip_simple_html("a<br class=\"x\">b".into()), "a\nb");
     }
 }

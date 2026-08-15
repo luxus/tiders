@@ -20,9 +20,13 @@ pub enum MediaCommand {
     Next,
     Previous,
     /// Relative seek (seconds, may be negative).
-    SeekBy { seconds: f64 },
+    SeekBy {
+        seconds: f64,
+    },
     /// Absolute seek (seconds from start).
-    SeekTo { seconds: f64 },
+    SeekTo {
+        seconds: f64,
+    },
 }
 
 /// Snapshot we push *to* the OS so applets show the right track.

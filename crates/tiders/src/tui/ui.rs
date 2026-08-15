@@ -14,9 +14,7 @@ use tiders_core::queue::{RepeatMode, ShuffleMode};
 use tiders_core::spectrum::{self, EqTheme};
 use tiders_core::PlayerStatus;
 
-use super::app::{
-    App, FavSection, LibSection, Popup, Screen, SearchScope, Tab, QUALITIES,
-};
+use super::app::{App, FavSection, LibSection, Popup, Screen, SearchScope, Tab, QUALITIES};
 use super::theme;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -257,7 +255,9 @@ fn empty_hint(app: &App) -> String {
     }
     match app.tab {
         Tab::Search => "No results yet — press / to filter, Enter to search the catalog.".into(),
-        Tab::Library => "Library is empty — playlists, mixes and For You load after sign-in.".into(),
+        Tab::Library => {
+            "Library is empty — playlists, mixes and For You load after sign-in.".into()
+        }
         Tab::Favorites => "No favorites loaded — press f to reload.".into(),
         Tab::Queue => "The queue is empty — pick a track and press Enter to play.".into(),
     }
@@ -267,7 +267,12 @@ fn collection_rows(app: &App) -> Vec<ListItem<'static>> {
     match app.tab {
         Tab::Search => match app.search_scope {
             SearchScope::Albums => map_visible(&app.results.albums, app, |a, hit| {
-                row(&a.title, &a.artist, "album", hit_title_indices(a.title.len(), hit))
+                row(
+                    &a.title,
+                    &a.artist,
+                    "album",
+                    hit_title_indices(a.title.len(), hit),
+                )
             }),
             SearchScope::Artists => map_visible(&app.results.artists, app, |a, hit| {
                 row(&a.name, "artist", "", hit_indices(hit))
@@ -292,7 +297,12 @@ fn collection_rows(app: &App) -> Vec<ListItem<'static>> {
                 )
             }),
             LibSection::Mixes => map_visible(&app.mixes, app, |m, hit| {
-                row(&m.title, &m.subtitle, "mix", hit_title_indices(m.title.len(), hit))
+                row(
+                    &m.title,
+                    &m.subtitle,
+                    "mix",
+                    hit_title_indices(m.title.len(), hit),
+                )
             }),
             LibSection::ForYou => map_visible(&app.for_you, app, |c, hit| {
                 let kind = match c.kind {
@@ -301,12 +311,22 @@ fn collection_rows(app: &App) -> Vec<ListItem<'static>> {
                     HomeCardKind::Album { .. } => "album",
                     HomeCardKind::Artist { .. } => "artist",
                 };
-                row(&c.title, &c.subtitle, kind, hit_title_indices(c.title.len(), hit))
+                row(
+                    &c.title,
+                    &c.subtitle,
+                    kind,
+                    hit_title_indices(c.title.len(), hit),
+                )
             }),
         },
         Tab::Favorites => match app.fav_section {
             FavSection::Albums => map_visible(&app.fav_albums, app, |a, hit| {
-                row(&a.title, a.artist.as_str(), "album", hit_title_indices(a.title.len(), hit))
+                row(
+                    &a.title,
+                    a.artist.as_str(),
+                    "album",
+                    hit_title_indices(a.title.len(), hit),
+                )
             }),
             FavSection::Artists => map_visible(&app.fav_artists, app, |a, hit| {
                 row(&a.name, "artist", "", hit_indices(hit))
@@ -347,7 +367,12 @@ fn row(title: &str, subtitle: &str, kind: &str, title_hits: Vec<usize>) -> ListI
         format!("{kind:<8} "),
         Style::default().fg(theme::ACCENT2),
     )];
-    spans.extend(super::filter::highlight(title, &title_hits, base, hit_style));
+    spans.extend(super::filter::highlight(
+        title,
+        &title_hits,
+        base,
+        hit_style,
+    ));
     if !subtitle.is_empty() {
         spans.push(Span::styled(format!("  {subtitle}"), theme::dim()));
     }
@@ -386,9 +411,19 @@ fn track_row<'a>(
         Span::styled(marker, Style::default().fg(theme::GREEN)),
         Span::styled(format!("{:>2}. ", index + 1), theme::dim()),
     ];
-    spans.extend(super::filter::highlight(&title, &title_hits, title_style, hit_style));
+    spans.extend(super::filter::highlight(
+        &title,
+        &title_hits,
+        title_style,
+        hit_style,
+    ));
     spans.push(Span::styled("  ", Style::default()));
-    spans.extend(super::filter::highlight(&artist, &artist_hits, theme::dim(), hit_style));
+    spans.extend(super::filter::highlight(
+        &artist,
+        &artist_hits,
+        theme::dim(),
+        hit_style,
+    ));
     if let Some(badge) = track.quality_badge() {
         spans.push(Span::styled(
             format!(" {badge}"),
@@ -425,7 +460,11 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let art_w = if has_art { inner.height.saturating_mul(2).min(inner.width / 3) } else { 0 };
+    let art_w = if has_art {
+        inner.height.saturating_mul(2).min(inner.width / 3)
+    } else {
+        0
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(art_w), Constraint::Min(10)])
@@ -433,7 +472,11 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
     let art_area = cols[0];
     let info_area = cols[1];
 
-    let spec_h = if show_spec { (info_area.height / 2).clamp(1, 4) } else { 0 };
+    let spec_h = if show_spec {
+        (info_area.height / 2).clamp(1, 4)
+    } else {
+        0
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -516,7 +559,10 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
             let lyric = current_lyric(app, elapsed);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(format!(" {} {}  ", shuffle.icon(), shuffle.label()), sh_style),
+                    Span::styled(
+                        format!(" {} {}  ", shuffle.icon(), shuffle.label()),
+                        sh_style,
+                    ),
                     Span::styled(format!("{} {}  ", repeat.icon(), repeat.label()), rp_style),
                     Span::styled(format!("vol {volume}%  "), theme::dim()),
                     Span::styled(format!("{pos}  "), Style::default().fg(theme::FG)),
@@ -620,7 +666,11 @@ fn draw_now_playing_stage(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
-                    format!("{}  ·  {}", track.artist, track.album.clone().unwrap_or_default()),
+                    format!(
+                        "{}  ·  {}",
+                        track.artist,
+                        track.album.clone().unwrap_or_default()
+                    ),
                     Style::default().fg(theme::ACCENT2),
                 )),
                 Line::from(Span::styled(qlabel, theme::dim())),
@@ -665,7 +715,9 @@ fn draw_now_playing_stage(frame: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Span::styled(
                 format::truncate(&format!("{}. {}", i + 1, t.title), qinner.width as usize),
                 if cur {
-                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     theme::dim()
                 },
@@ -753,9 +805,19 @@ fn current_lyric(app: &App, elapsed: f64) -> Option<String> {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = if app.input_mode {
         if app.tab == Tab::Search && app.nav.is_empty() {
-            &[("Enter", "catalog"), ("↑↓", "move"), ("Esc", "clear"), ("C-u", "reset")]
+            &[
+                ("Enter", "catalog"),
+                ("↑↓", "move"),
+                ("Esc", "clear"),
+                ("C-u", "reset"),
+            ]
         } else {
-            &[("Enter", "open"), ("↑↓", "move"), ("Esc", "clear"), ("C-u", "reset")]
+            &[
+                ("Enter", "open"),
+                ("↑↓", "move"),
+                ("Esc", "clear"),
+                ("C-u", "reset"),
+            ]
         }
     } else if app.filter_active() {
         &[
@@ -853,7 +915,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     };
     let desc = |d: &str| Span::styled(format!("  {d}"), theme::base());
     let rows = [
-        ("/", "filter the current list (FFF) — Enter searches the catalog"),
+        (
+            "/",
+            "filter the current list (FFF) — Enter searches the catalog",
+        ),
         ("Tab / 1–4", "Search · Library · Favorites · Queue"),
         ("t / S", "cycle search scope / library-favorites section"),
         ("Enter", "play or open the highlighted item"),
@@ -1025,8 +1090,7 @@ fn draw_toast(frame: &mut Frame, app: &mut App) {
             );
         }
         frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(fg)))
-                .alignment(Alignment::Left),
+            Paragraph::new(Span::styled(text, Style::default().fg(fg))).alignment(Alignment::Left),
             cols[1],
         );
     } else {

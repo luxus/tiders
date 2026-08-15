@@ -417,8 +417,7 @@ impl App {
         if self.player.status() == PlayerStatus::Playing {
             return true;
         }
-        if self.toast.is_some() || self.popup.is_some() || self.loading || self.login.is_some()
-        {
+        if self.toast.is_some() || self.popup.is_some() || self.loading || self.login.is_some() {
             return true;
         }
         if self.input_mode {
@@ -781,7 +780,9 @@ impl App {
         };
         let stream = service.stream_url(track.id, quality).await;
         match stream {
-            Ok(info) => match self.player.play_current_with_quality(&info.url, info.quality.clone())
+            Ok(info) => match self
+                .player
+                .play_current_with_quality(&info.url, info.quality.clone())
             {
                 Ok(()) => {
                     self.stream_quality = info.quality;
@@ -1126,7 +1127,12 @@ impl App {
                     .iter()
                     .map(|a| format!("{} {}", a.title, a.artist))
                     .collect(),
-                SearchScope::Artists => self.results.artists.iter().map(|a| a.name.clone()).collect(),
+                SearchScope::Artists => self
+                    .results
+                    .artists
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect(),
                 SearchScope::Playlists => self
                     .results
                     .playlists

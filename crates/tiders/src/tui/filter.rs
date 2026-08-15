@@ -17,11 +17,12 @@ pub struct Hit {
 }
 
 fn config() -> Config {
-    let mut cfg = Config::default();
-    // One typo is the sweet spot for catalog titles ("discovry" → Discovery).
-    cfg.max_typos = Some(1);
-    cfg.sort = true;
-    cfg
+    Config {
+        // One typo is the sweet spot for catalog titles ("discovry" → Discovery).
+        max_typos: Some(1),
+        sort: true,
+        ..Config::default()
+    }
 }
 
 /// Rank `haystacks` for `needle`. Empty needle → every row, original order.
@@ -62,7 +63,11 @@ pub fn rank(needle: &str, haystacks: &[String]) -> Vec<Hit> {
 }
 
 /// Split a haystack of `"title {sep} rest"` into highlight sets for each side.
-pub fn split_highlights(title_len: usize, sep_len: usize, indices: &[usize]) -> (Vec<usize>, Vec<usize>) {
+pub fn split_highlights(
+    title_len: usize,
+    sep_len: usize,
+    indices: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
     let mut title = Vec::new();
     let mut rest = Vec::new();
     let rest_start = title_len + sep_len;
@@ -137,7 +142,10 @@ mod tests {
     #[test]
     fn empty_needle_keeps_order() {
         let hits = rank("", &titles());
-        assert_eq!(hits.iter().map(|h| h.index).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            hits.iter().map(|h| h.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
     }
 
     #[test]

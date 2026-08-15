@@ -53,12 +53,8 @@ pub fn quality_badge(tag: Option<&str>) -> Option<&'static str> {
         Some("HIRES")
     } else if t.contains("LOSSLESS") || t.contains("FLAC") {
         Some("FLAC")
-    } else if t.contains("HIGH") || t.contains("320") {
+    } else if t.contains("HIGH") || t.contains("320") || t.contains("LOW") || t.contains("96") {
         Some("AAC")
-    } else if t.contains("LOW") || t.contains("96") {
-        Some("AAC")
-    } else if t.is_empty() {
-        None
     } else {
         None
     }
@@ -66,7 +62,11 @@ pub fn quality_badge(tag: Option<&str>) -> Option<&'static str> {
 
 /// Pretty-print a decoded stream: `FLAC 24-bit 96 kHz`, `AAC 320 kbps`, …
 pub fn stream_quality_label(q: &crate::model::StreamQuality) -> String {
-    let codec = codec_name(q.codecs.as_deref(), q.mime_type.as_deref(), q.audio_quality.as_deref());
+    let codec = codec_name(
+        q.codecs.as_deref(),
+        q.mime_type.as_deref(),
+        q.audio_quality.as_deref(),
+    );
     let mut parts = vec![codec];
     if let Some(bits) = q.bit_depth {
         parts.push(format!("{bits}-bit"));
@@ -109,9 +109,7 @@ fn codec_name(codecs: Option<&str>, mime: Option<&str>, quality: Option<&str>) -
         "Hi-Res".into()
     } else if q.contains("LOSSLESS") {
         "Lossless".into()
-    } else if q.contains("HIGH") {
-        "AAC".into()
-    } else if q.contains("LOW") {
+    } else if q.contains("HIGH") || q.contains("LOW") {
         "AAC".into()
     } else {
         "Stream".into()
@@ -131,10 +129,15 @@ pub fn bit_depth_from_format(fmt: &str) -> Option<u8> {
     let f = fmt.to_ascii_lowercase();
     if f.contains("s16") || f.contains("u16") {
         Some(16)
-    } else if f.contains("s24") || f.contains("u24") {
+    } else if f.contains("s24")
+        || f.contains("u24")
+        || f.contains("s32")
+        || f.contains("u32")
+        || f.contains("float")
+        || f.contains("dbl")
+    {
+        // s32/float playback is typically a 24-bit master.
         Some(24)
-    } else if f.contains("s32") || f.contains("u32") || f.contains("float") || f.contains("dbl") {
-        Some(24) // float/s32 playback of a 24-bit master
     } else {
         None
     }
