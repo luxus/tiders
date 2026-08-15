@@ -269,6 +269,9 @@ pub struct App {
     /// Ranked hits for the current `input` needle (FFF / neo_frizbee).
     /// `None` means the needle is empty and the view is unfiltered.
     filter_hits: Option<Vec<super::filter::Hit>>,
+    /// Source-row index → position in `filter_hits` so highlight lookup stays
+    /// O(1) after the visible view is sorted.
+    filter_by_src: std::collections::HashMap<usize, usize>,
 
     pub results: SearchResults,
     pub favorites: Vec<TrackView>,
@@ -349,6 +352,7 @@ impl App {
             input_mode: false,
             input: String::new(),
             filter_hits: None,
+            filter_by_src: std::collections::HashMap::new(),
             results: SearchResults::default(),
             favorites: Vec::new(),
             fav_albums: Vec::new(),
@@ -676,7 +680,7 @@ impl App {
                 self.nav.clear();
                 // Catalog already narrowed the list; show every hit.
                 self.input.clear();
-                self.filter_hits = None;
+                self.set_filter_hits(None);
                 self.select_first();
             }
             Err(e) => self.set_status(format!("Search failed: {e}")),
@@ -813,15 +817,34 @@ impl App {
         let albums = self.service.as_ref().unwrap().artist_albums(id).await;
         let bio = self.service.as_ref().unwrap().artist_bio(id).await;
         self.loading = false;
-        self.page_tracks = tracks.unwrap_or_default();
-        self.page_albums = albums.unwrap_or_default();
+        let mut errors = Vec::new();
+        self.page_tracks = match tracks {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(format!("songs: {e}"));
+                Vec::new()
+            }
+        };
+        self.page_albums = match albums {
+            Ok(a) => a,
+            Err(e) => {
+                errors.push(format!("albums: {e}"));
+                Vec::new()
+            }
+        };
         self.page_bio = bio.unwrap_or_default();
-        self.page_artist = profile.ok().or(Some(ArtistView {
-            id,
-            name: name.clone(),
-            picture: None,
-            mix_id: None,
-        }));
+        self.page_artist = match profile {
+            Ok(a) => Some(a),
+            Err(e) => {
+                errors.push(format!("profile: {e}"));
+                Some(ArtistView {
+                    id,
+                    name: name.clone(),
+                    picture: None,
+                    mix_id: None,
+                })
+            }
+        };
         self.page_art = None;
         if let Some(pic) = self
             .page_artist
@@ -834,7 +857,9 @@ impl App {
         self.nav.push(Page::Artist { id, name });
         self.clear_filter();
         self.select_first();
-        if self.page_tracks.is_empty() && self.page_albums.is_empty() {
+        if !errors.is_empty() {
+            self.set_status(format!("Artist: {}", errors.join("; ")));
+        } else if self.page_tracks.is_empty() && self.page_albums.is_empty() {
             self.set_status("Artist loaded with no songs or albums yet".into());
         }
     }
@@ -1207,7 +1232,7 @@ impl App {
         }
         let loved = self.loved.contains(&track.id);
         if force_like && loved {
-            self.set_status(format!("Already liked {}", track.title));
+            self.set_status(format!("Already in favorites: {}", track.title));
             return;
         }
         let result = if loved {
@@ -1222,7 +1247,7 @@ impl App {
                     self.set_status(format!("Removed {} from favorites", track.title));
                 } else {
                     self.loved.insert(track.id);
-                    self.set_status(format!("Liked {}", track.title));
+                    self.set_status(format!("Added {} to favorites", track.title));
                 }
             }
             Err(e) => self.set_status(format!("Favorite: {e}")),
@@ -1410,25 +1435,34 @@ impl App {
         self.filter_hits.is_some()
     }
 
-    pub fn hit_at(&self, filtered_index: usize) -> Option<&super::filter::Hit> {
-        let src = self.orig_at(filtered_index);
-        self.filter_hits.as_ref()?.iter().find(|h| h.index == src)
+    pub fn hit_for_source(&self, src: usize) -> Option<&super::filter::Hit> {
+        let hits = self.filter_hits.as_ref()?;
+        hits.get(*self.filter_by_src.get(&src)?)
     }
 
     pub fn clear_filter(&mut self) {
         self.input.clear();
-        self.filter_hits = None;
+        self.set_filter_hits(None);
     }
 
     /// Re-rank the visible corpus against `self.input` (FFF / neo_frizbee).
     pub fn recompute_filter(&mut self) {
         let needle = self.input.trim();
         if needle.is_empty() {
-            self.filter_hits = None;
+            self.set_filter_hits(None);
             return;
         }
         let hay = self.collect_haystacks();
-        self.filter_hits = Some(super::filter::rank(needle, &hay));
+        self.set_filter_hits(Some(super::filter::rank(needle, &hay)));
+    }
+
+    fn set_filter_hits(&mut self, hits: Option<Vec<super::filter::Hit>>) {
+        self.filter_by_src.clear();
+        if let Some(ref hits) = hits {
+            self.filter_by_src
+                .extend(hits.iter().enumerate().map(|(i, h)| (h.index, i)));
+        }
+        self.filter_hits = hits;
     }
 
     fn collect_haystacks(&self) -> Vec<String> {
@@ -1809,4 +1843,40 @@ fn write_exclusive_cover(cover_id: &str, bytes: &[u8]) -> Option<std::path::Path
         return None;
     }
     Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::filter::Hit;
+    use std::collections::HashMap;
+
+    fn index_hits(hits: &[Hit]) -> HashMap<usize, usize> {
+        hits.iter().enumerate().map(|(i, h)| (h.index, i)).collect()
+    }
+
+    #[test]
+    fn filter_by_src_survives_sorted_view_order() {
+        let hits = vec![
+            Hit {
+                index: 4,
+                indices: vec![0],
+            },
+            Hit {
+                index: 1,
+                indices: vec![2],
+            },
+            Hit {
+                index: 7,
+                indices: vec![1],
+            },
+        ];
+        let by_src = index_hits(&hits);
+        // Ranked order is 4, 1, 7; sorted visible order is 1, 4, 7.
+        let visible = [1usize, 4, 7];
+        let looked: Vec<&[usize]> = visible
+            .iter()
+            .map(|src| hits[*by_src.get(src).unwrap()].indices.as_slice())
+            .collect();
+        assert_eq!(looked, vec![&[2][..], &[0][..], &[1][..]]);
+    }
 }

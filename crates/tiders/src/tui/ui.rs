@@ -652,8 +652,7 @@ fn map_visible<'a, T>(
     let order = app.view_indices();
     order
         .into_iter()
-        .enumerate()
-        .filter_map(|(i, src)| items.get(src).map(|item| f(item, app.hit_at(i))))
+        .filter_map(|src| items.get(src).map(|item| f(item, app.hit_for_source(src))))
         .collect()
 }
 
