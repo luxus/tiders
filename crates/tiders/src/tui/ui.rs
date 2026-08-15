@@ -1257,9 +1257,13 @@ fn draw_context_menu(frame: &mut Frame, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.hits.context.clear();
+    app.hits.context_area = Some(area);
     let mut lines = Vec::new();
     for (i, label) in labels.iter().enumerate() {
-        let rect = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        // Full menu width (including side borders) so a click on the edge still
+        // hits the row instead of falling through and closing the menu.
+        let row_y = inner.y + i as u16;
+        let rect = Rect::new(area.x, row_y, area.width, 1);
         app.hits.context.push((rect, i));
         let style = if i == cursor {
             theme::selected()
@@ -1293,8 +1297,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("t / S", "cycle search scope / favorites section"),
         ("Enter", "play or open the highlighted item"),
         (
-            "right-click",
-            "artist · album · favorite · like · don't like",
+            "c / right-click",
+            "track menu: artist · album · favorite · like · don't like",
         ),
         ("a / A", "add track / add all to queue"),
         ("Space", "play / pause"),
@@ -1451,15 +1455,9 @@ fn draw_toast(frame: &mut Frame, app: &mut App) {
         3
     };
     let full = frame.area();
-    if full.width < w + 4 || full.height < h + 3 {
+    let Some(area) = toast_rect(full, w, h) else {
         return;
-    }
-    let area = Rect::new(
-        full.width.saturating_sub(w + 3),
-        full.height.saturating_sub(h + 2),
-        w,
-        h,
-    );
+    };
     let fg = theme::blend(theme::YELLOW, theme::SURFACE, 1.0 - alpha);
     let sub_fg = theme::blend(theme::ACCENT2, theme::SURFACE, 1.0 - alpha);
     let border = theme::blend(theme::ACCENT, theme::SURFACE, 1.0 - alpha);
@@ -1723,4 +1721,27 @@ fn centered_pct(pct_w: u16, pct_h: u16, area: Rect) -> Rect {
     let w = area.width * pct_w.min(100) / 100;
     let h = area.height * pct_h.min(100) / 100;
     centered_rect(w, h, area)
+}
+
+/// Top-right toast slot, with a one-cell margin from the edges.
+fn toast_rect(full: Rect, w: u16, h: u16) -> Option<Rect> {
+    if full.width < w + 4 || full.height < h + 3 {
+        return None;
+    }
+    Some(Rect::new(full.width.saturating_sub(w + 3), 1, w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toast_rect;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn toast_sits_top_right() {
+        let area = toast_rect(Rect::new(0, 0, 80, 24), 20, 4).unwrap();
+        assert_eq!(area.x, 57);
+        assert_eq!(area.y, 1);
+        assert_eq!(area.width, 20);
+        assert_eq!(area.height, 4);
+    }
 }

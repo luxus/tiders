@@ -17,6 +17,8 @@ pub enum Hit {
     SidebarToggle,
     UpNext,
     ContextItem(usize),
+    /// Click landed on the menu chrome (border / title) — keep it open.
+    ContextChrome,
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +36,7 @@ pub struct HitMap {
     pub sidebar_toggle: Option<Rect>,
     pub up_next: Option<Rect>,
     pub context: Vec<(Rect, usize)>,
+    pub context_area: Option<Rect>,
 }
 
 impl HitMap {
@@ -51,6 +54,7 @@ impl HitMap {
         self.sidebar_toggle = None;
         self.up_next = None;
         self.context.clear();
+        self.context_area = None;
     }
 
     pub fn at(&self, col: u16, row: u16) -> Option<Hit> {
@@ -58,6 +62,11 @@ impl HitMap {
         for (rect, i) in &self.context {
             if rect.contains(pos) {
                 return Some(Hit::ContextItem(*i));
+            }
+        }
+        if let Some(area) = self.context_area {
+            if area.contains(pos) {
+                return Some(Hit::ContextChrome);
             }
         }
         if let Some(toggle) = self.sidebar_toggle {
@@ -197,6 +206,28 @@ mod tests {
         match hits.at(4, 8) {
             Some(Hit::Playlist(2)) => {}
             other => panic!("expected playlist hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_item_beats_chrome_and_list() {
+        let hits = HitMap {
+            list: Some(Rect::new(0, 0, 40, 20)),
+            context_area: Some(Rect::new(10, 5, 22, 7)),
+            context: vec![(Rect::new(10, 6, 22, 1), 0), (Rect::new(10, 7, 22, 1), 1)],
+            ..Default::default()
+        };
+        match hits.at(12, 7) {
+            Some(Hit::ContextItem(1)) => {}
+            other => panic!("expected context item, got {other:?}"),
+        }
+        match hits.at(10, 5) {
+            Some(Hit::ContextChrome) => {}
+            other => panic!("expected chrome on border, got {other:?}"),
+        }
+        match hits.at(2, 2) {
+            Some(Hit::ListRow(_)) => {}
+            other => panic!("expected list outside menu, got {other:?}"),
         }
     }
 }

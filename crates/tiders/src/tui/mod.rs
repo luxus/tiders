@@ -336,6 +336,10 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('e') => app.toggle_spectrum(),
         KeyCode::Char('E') => app.cycle_eq_theme(),
         KeyCode::Char('x') => app.stop(),
+        KeyCode::Char('c') | KeyCode::Menu => app.open_context_for_selection(),
+        KeyCode::F(10) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.open_context_for_selection();
+        }
         KeyCode::Char('f') => {
             app.load_library().await;
         }
@@ -349,14 +353,20 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
     if matches!(app.popup, Some(Popup::Context(_))) {
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(Hit::ContextItem(i)) = app.hits.at(mouse.column, mouse.row) {
-                    if let Some(Popup::Context(menu)) = app.popup.as_mut() {
-                        menu.cursor = i;
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                match app.hits.at(mouse.column, mouse.row) {
+                    Some(Hit::ContextItem(i)) => {
+                        if let Some(Popup::Context(menu)) = app.popup.as_mut() {
+                            menu.cursor = i;
+                        }
+                        app.context_activate().await;
                     }
-                    app.context_activate().await;
-                } else {
-                    app.close_popup();
+                    Some(Hit::ContextChrome) => {}
+                    _ => {
+                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                            app.close_popup();
+                        }
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => app.close_popup(),
@@ -417,7 +427,12 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     .or_else(|| app.player.now_playing().cloned()),
             };
             if let Some(track) = track {
-                app.open_context(mouse.column, mouse.row, track);
+                // Place the first item under the cursor (border is 1 cell).
+                app.open_context(
+                    mouse.column.saturating_sub(1),
+                    mouse.row.saturating_sub(1),
+                    track,
+                );
             }
         }
         MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
@@ -486,7 +501,7 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         app.seek_ratio(ratio);
                     }
                 }
-                Hit::ContextItem(_) => {}
+                Hit::ContextItem(_) | Hit::ContextChrome => {}
             }
         }
         _ => {}

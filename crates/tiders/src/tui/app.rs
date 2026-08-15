@@ -610,26 +610,48 @@ impl App {
             .service
             .as_ref()
             .unwrap()
-            .favorite_tracks_all(2000)
+            .favorite_tracks_all(10_000)
             .await;
-        let albums = self.service.as_ref().unwrap().favorite_albums(100, 0).await;
-        let artists = self.service.as_ref().unwrap().favorite_artists(100).await;
+        let albums = self
+            .service
+            .as_ref()
+            .unwrap()
+            .favorite_albums_all(10_000)
+            .await;
+        let artists = self
+            .service
+            .as_ref()
+            .unwrap()
+            .favorite_artists_all(10_000)
+            .await;
         self.loading = false;
+        let mut parts = Vec::new();
         match tracks {
             Ok(tracks) => {
                 self.loved = tracks.iter().map(|t| t.id).collect();
                 let n = tracks.len();
                 self.favorites = tracks;
-                self.set_status(format!("Loaded {n} saved song(s)"));
+                parts.push(format!("{n} song(s)"));
             }
-            Err(e) => self.set_status(format!("Library: {e}")),
+            Err(e) => parts.push(format!("songs: {e}")),
         }
-        if let Ok(albums) = albums {
-            self.fav_albums = albums;
+        match albums {
+            Ok(albums) => {
+                let n = albums.len();
+                self.fav_albums = albums;
+                parts.push(format!("{n} album(s)"));
+            }
+            Err(e) => parts.push(format!("albums: {e}")),
         }
-        if let Ok(artists) = artists {
-            self.fav_artists = artists;
+        match artists {
+            Ok(artists) => {
+                let n = artists.len();
+                self.fav_artists = artists;
+                parts.push(format!("{n} artist(s)"));
+            }
+            Err(e) => parts.push(format!("artists: {e}")),
         }
+        self.set_status(format!("Library: {}", parts.join(" · ")));
     }
 
     pub async fn load_playlists(&mut self) {
@@ -1171,6 +1193,39 @@ impl App {
             cursor: 0,
             track,
         })));
+    }
+
+    /// Keyboard entry for the track context menu (`c`, Shift+F10, Menu).
+    pub fn open_context_for_selection(&mut self) {
+        let Some(track) = self
+            .selected_track()
+            .or_else(|| self.player.now_playing().cloned())
+        else {
+            self.set_status("No track for the context menu".into());
+            return;
+        };
+        let (x, y) = self.context_anchor();
+        self.open_context(x, y, track);
+    }
+
+    fn context_anchor(&self) -> (u16, u16) {
+        if let Some(list) = self.hits.list {
+            let sel = self.list_state.selected().unwrap_or(0);
+            let row = sel.saturating_sub(self.hits.list_offset) as u16;
+            return (
+                list.x.saturating_add(2),
+                list.y.saturating_add(row).saturating_sub(1),
+            );
+        }
+        if let Some(queue) = self.hits.queue {
+            let sel = self.np_queue_state.selected().unwrap_or(0);
+            let row = sel.saturating_sub(self.hits.queue_offset) as u16;
+            return (
+                queue.x.saturating_add(2),
+                queue.y.saturating_add(row).saturating_sub(1),
+            );
+        }
+        (8, 6)
     }
 
     pub fn context_move(&mut self, delta: isize) {

@@ -225,7 +225,7 @@ library. Keys:
 | `Tab` / `1`–`7` | Search · For You · Mixes · Library · Playlists · Favorites · Queue |
 | `b` / `\` | show / hide the left sidebar |
 | click / drag | sidebar, row, queue, or sort header; second click on a row plays; drag the scrubber to seek; wheel moves the selection |
-| right-click | context menu: go to artist / album, add or remove favorite, like, don't like |
+| `c` / right-click | context menu: go to artist / album, add or remove favorite, like, don't like (`j`/`k` + Enter, or click a row) |
 | `t` | cycle search scope (tracks / albums / artists / playlists) |
 | `S` | cycle Favorites section |
 | `o` | cycle table sort (title · artist · album · time); click a header to sort |
