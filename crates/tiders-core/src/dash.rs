@@ -8,6 +8,7 @@
 //! shared stitcher used by playback (write an MPD) and downloads (concat +
 //! remux).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -100,27 +101,47 @@ pub fn file_url(path: &Path) -> Result<String> {
     media::file_url(path).ok_or_else(|| Error::other("DASH cache path is not valid UTF-8"))
 }
 
-/// Concatenate init + media segments into one fMP4 byte buffer.
+/// Concatenate init + media segments into `dest` (typically a `.mp4` / `.m4a`
+/// next to the final FLAC).
 ///
-/// Stops after `consecutive_404` missing segments (TIDAL returns 404 past the
-/// last chunk). Used by the downloader; playback prefers [`write_playback_mpd`].
-pub async fn stitch_bytes(assembly: &DashAssembly) -> Result<Vec<u8>> {
+/// Segments are streamed to a sibling `.part` file and renamed on success so a
+/// failed stitch does not leave a truncated dest. Stops after three consecutive
+/// missing segments (TIDAL returns 404 past the last chunk). Playback prefers
+/// [`write_playback_mpd`].
+pub async fn stitch_to_file(assembly: &DashAssembly, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    }
+    let part = sibling_part(dest);
+    match stitch_into(assembly, &part).await {
+        Ok(()) => std::fs::rename(&part, dest).map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            Error::io(dest, e)
+        }),
+        Err(err) => {
+            let _ = std::fs::remove_file(&part);
+            Err(err)
+        }
+    }
+}
+
+async fn stitch_into(assembly: &DashAssembly, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("tiders/0.1")
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|e| Error::other(format!("http client: {e}")))?;
 
-    let mut out = Vec::new();
-    let init = download_segment(&client, &assembly.init_url).await?;
-    out.extend_from_slice(&init);
+    let mut file = std::fs::File::create(dest).map_err(|e| Error::io(dest, e))?;
+    copy_segment(&client, &assembly.init_url, &mut file).await?;
 
     let mut consecutive_misses = 0u8;
+    let mut media_n = 0usize;
     for url in &assembly.media_urls {
-        match download_segment(&client, url).await {
-            Ok(bytes) => {
-                out.extend_from_slice(&bytes);
+        match copy_segment(&client, url, &mut file).await {
+            Ok(_) => {
                 consecutive_misses = 0;
+                media_n += 1;
             }
             Err(e) if is_missing(&e) => {
                 consecutive_misses += 1;
@@ -131,24 +152,16 @@ pub async fn stitch_bytes(assembly: &DashAssembly) -> Result<Vec<u8>> {
             Err(e) => return Err(e),
         }
     }
-    if out.len() <= init.len() {
+    file.flush().map_err(|e| Error::io(dest, e))?;
+    drop(file);
+    if media_n == 0 {
         return Err(Error::other("DASH stitch downloaded no media segments"));
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Write stitched fMP4 to `dest` (typically a `.mp4` / `.m4a` next to the
-/// final FLAC).
-pub async fn stitch_to_file(assembly: &DashAssembly, dest: &Path) -> Result<()> {
-    let bytes = stitch_bytes(assembly).await?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    }
-    std::fs::write(dest, bytes).map_err(|e| Error::io(dest, e))
-}
-
-async fn download_segment(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let response = client
+async fn copy_segment(client: &reqwest::Client, url: &str, dest: &mut impl Write) -> Result<u64> {
+    let mut response = client
         .get(url)
         .send()
         .await
@@ -160,14 +173,31 @@ async fn download_segment(client: &reqwest::Client, url: &str) -> Result<Vec<u8>
     if !status.is_success() {
         return Err(Error::other(format!("DASH segment HTTP {status}")));
     }
-    let bytes = response
-        .bytes()
+    let mut n = 0u64;
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| Error::other(format!("DASH segment body: {e}")))?;
-    if bytes.is_empty() {
+        .map_err(|e| Error::other(format!("DASH segment body: {e}")))?
+    {
+        dest.write_all(&chunk)
+            .map_err(|e| Error::other(format!("DASH segment write: {e}")))?;
+        n += chunk.len() as u64;
+    }
+    if n == 0 {
         return Err(Error::other("DASH segment empty"));
     }
-    Ok(bytes.to_vec())
+    Ok(n)
+}
+
+fn sibling_part(dest: &Path) -> PathBuf {
+    match dest.file_name() {
+        Some(name) => {
+            let mut name = name.to_os_string();
+            name.push(".part");
+            dest.with_file_name(name)
+        }
+        None => dest.join("download.part"),
+    }
 }
 
 fn is_missing(err: &Error) -> bool {
@@ -360,6 +390,67 @@ mod tests {
         assert!(path.ends_with("42.mpd"));
         let xml = std::fs::read_to_string(&path).unwrap();
         assert!(xml.contains("chunk-$Number$.m4s"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stitch_streams_to_file_and_stops_on_404() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.split_whitespace().nth(1).unwrap_or("/");
+                    let (status, body): (&str, &[u8]) = match path {
+                        "/init.mp4" => ("200 OK", b"INIT"),
+                        "/chunk-1.m4s" => ("200 OK", b"A"),
+                        "/chunk-2.m4s" => ("200 OK", b"B"),
+                        _ => ("404 Not Found", b""),
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let assembly = DashAssembly {
+            mime_type: "audio/mp4".into(),
+            codecs: "flac".into(),
+            bitrate: None,
+            init_url: format!("http://{addr}/init.mp4"),
+            media_urls: vec![
+                format!("http://{addr}/chunk-1.m4s"),
+                format!("http://{addr}/chunk-2.m4s"),
+                format!("http://{addr}/chunk-3.m4s"),
+                format!("http://{addr}/chunk-4.m4s"),
+                format!("http://{addr}/chunk-5.m4s"),
+            ],
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "tiders-stitch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dest = dir.join("out.mp4");
+        stitch_to_file(&assembly, &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"INITAB");
+        assert!(!sibling_part(&dest).exists(), "part file must be renamed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

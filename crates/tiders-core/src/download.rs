@@ -4,6 +4,7 @@
 //! fMP4 then remuxed to FLAC with `ffmpeg -c copy` when ffmpeg is on PATH
 //! (same approach as yadal / streamrip). Without ffmpeg the fMP4 is kept.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -184,21 +185,46 @@ async fn download_url(url: &str, dest: &Path) -> Result<()> {
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| Error::other(format!("http client: {e}")))?;
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
         .map_err(|e| Error::other(format!("download: {e}")))?
         .error_for_status()
         .map_err(|e| Error::other(format!("download status: {e}")))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| Error::other(format!("download body: {e}")))?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
-    std::fs::write(dest, &bytes).map_err(|e| Error::io(dest, e))
+    let part = sibling_part(dest);
+    let result = async {
+        let mut file = std::fs::File::create(&part).map_err(|e| Error::io(&part, e))?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::other(format!("download body: {e}")))?
+        {
+            file.write_all(&chunk).map_err(|e| Error::io(&part, e))?;
+        }
+        file.flush().map_err(|e| Error::io(&part, e))?;
+        drop(file);
+        std::fs::rename(&part, dest).map_err(|e| Error::io(dest, e))
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
+fn sibling_part(dest: &Path) -> PathBuf {
+    match dest.file_name() {
+        Some(name) => {
+            let mut name = name.to_os_string();
+            name.push(".part");
+            dest.with_file_name(name)
+        }
+        None => dest.join("download.part"),
+    }
 }
 
 fn remux_flac(src: &Path, dest: &Path) -> Result<()> {
@@ -314,6 +340,15 @@ mod tests {
                 "https://listen.tidal.com/playlist/aa692128-2954-4fe1-b5a1-4ede1add485d?play=true"
             ),
             "aa692128-2954-4fe1-b5a1-4ede1add485d"
+        );
+    }
+
+    #[test]
+    fn part_file_keeps_original_filename() {
+        let dest = PathBuf::from("/tmp/01 - Artist - Title.flac");
+        assert_eq!(
+            sibling_part(&dest),
+            PathBuf::from("/tmp/01 - Artist - Title.flac.part")
         );
     }
 }

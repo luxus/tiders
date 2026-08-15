@@ -349,6 +349,9 @@ impl Engine {
             EngineCommand::DownloadPlaylist { uuid, dest } => {
                 let dest = dest.unwrap_or_else(download::default_dest);
                 let tracks = self.service.playlist_tracks(&uuid).await?;
+                if tracks.is_empty() {
+                    return Err(Error::other("playlist is empty"));
+                }
                 let report = download::download_tracks(
                     &mut self.service,
                     &tracks,

@@ -24,3 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Spectrum visualiser PCM tap is locked to the main player's clock instead of
   wall-time from when the silent sidecar started, so bars match the audible
   position (including seek / pause).
+- Direct and DASH downloads stream HTTP bodies to a sibling `.part` file
+  instead of buffering the whole track in memory.
+- `DownloadPlaylist` errors on an empty playlist, matching `PlayPlaylist`.
+- IPC `bind()` surfaces socket-directory errors and sets the control socket
+  to mode `0600`.

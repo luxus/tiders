@@ -12,6 +12,7 @@
 //! The socket lives at `$XDG_RUNTIME_DIR/tiders.sock` (override with
 //! `TIDERS_SOCK` or `--socket`). Only one daemon binds it.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -90,9 +91,14 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         let _ = std::fs::remove_file(path);
     }
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     }
-    UnixListener::bind(path).map_err(|e| Error::io(path, e))
+    let listener = UnixListener::bind(path).map_err(|e| Error::io(path, e))?;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(path);
+        return Err(Error::io(path, e));
+    }
+    Ok(listener)
 }
 
 /// Accept loop: each connection gets hello + optional event stream.
@@ -275,6 +281,12 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let listener = bind(&path).expect("bind");
+        let mode = std::fs::metadata(&path)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "ipc socket must be owner-only");
         let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, _) = tokio::sync::broadcast::channel(8);
         tokio::spawn(serve(listener, job_tx, ev_tx));
