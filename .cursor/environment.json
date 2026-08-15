@@ -1,0 +1,4 @@
+{
+  "name": "Tiders",
+  "install": "bash .cursor/install.sh"
+}

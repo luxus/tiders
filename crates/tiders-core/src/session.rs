@@ -11,11 +11,11 @@
 //! - resolving a track id into a playable [`StreamInfo`] for the
 //!   [`Player`](crate::player::Player).
 
-use tidlers::TidalClient;
 use tidlers::auth::TidalAuth;
 use tidlers::client::models::search::config::SearchConfig;
 use tidlers::client::models::track::config::TrackPlaybackInfoConfig;
 use tidlers::client::oauth::OAuthStatus;
+use tidlers::TidalClient;
 
 use crate::config::{Config, Quality};
 use crate::error::{Error, Result};
@@ -210,7 +210,11 @@ impl TidalService {
             .client
             .get_collection_track_favorites(Some(limit), Some(offset))
             .await?;
-        Ok(response.items.iter().map(|e| TrackView::from(&e.item)).collect())
+        Ok(response
+            .items
+            .iter()
+            .map(|e| TrackView::from(&e.item))
+            .collect())
     }
 
     /// List the user's own playlists.

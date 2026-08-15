@@ -57,11 +57,7 @@ impl From<tidlers::client::models::track::Track> for TrackView {
 
 impl From<&tidlers::client::models::search::SearchTrackHit> for TrackView {
     fn from(h: &tidlers::client::models::search::SearchTrackHit) -> Self {
-        let names: Vec<String> = h
-            .artists
-            .iter()
-            .filter_map(|a| a.name.clone())
-            .collect();
+        let names: Vec<String> = h.artists.iter().filter_map(|a| a.name.clone()).collect();
         TrackView {
             id: h.id,
             title: h.title.clone(),

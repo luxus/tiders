@@ -30,21 +30,16 @@ pub enum PlayerStatus {
 }
 
 /// Which audio backend to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     /// Use `mpv` if available, otherwise fall back to the null backend.
+    #[default]
     Auto,
     /// Force the `mpv` subprocess backend.
     Mpv,
     /// Force the headless null backend (no audio).
     Null,
-}
-
-impl Default for BackendKind {
-    fn default() -> Self {
-        BackendKind::Auto
-    }
 }
 
 impl BackendKind {

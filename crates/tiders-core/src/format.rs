@@ -65,10 +65,7 @@ mod tests {
         assert_eq!(artists(&[]), "");
         assert_eq!(artists(&["Air".into()]), "Air");
         assert_eq!(artists(&["Air".into(), "Phoenix".into()]), "Air & Phoenix");
-        assert_eq!(
-            artists(&["A".into(), "B".into(), "C".into()]),
-            "A, B & C"
-        );
+        assert_eq!(artists(&["A".into(), "B".into(), "C".into()]), "A, B & C");
     }
 
     #[test]
