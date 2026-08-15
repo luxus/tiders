@@ -39,8 +39,8 @@ pub mod spectrum;
 
 pub use config::Config;
 pub use error::{Error, Result};
-pub use lyrics::{current_line_index, parse_lrc, LyricLine};
-pub use media::{MediaBridge, MediaCommand, MediaNowPlaying};
+pub use lyrics::{current_line_index, from_tidal, parse_lrc, LyricLine};
+pub use media::{file_url, MediaBridge, MediaCommand, MediaNowPlaying};
 pub use playcount::PlayCountStore;
 pub use player::{AudioBackend, BackendKind, NullBackend, Player, PlayerState, PlayerStatus};
 pub use queue::{Queue, QueueItem, RepeatMode, ShuffleMode};

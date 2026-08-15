@@ -213,7 +213,7 @@ impl Player {
         };
         self.backend.set_volume(self.volume)?;
         self.backend.play(url)?;
-        let _ = self.backend.set_media_title(&track.label());
+        let _ = self.backend.set_media_title(&track.title);
         let _ = self
             .backend
             .set_loop_file(self.queue.repeat() == RepeatMode::One);

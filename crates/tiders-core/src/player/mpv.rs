@@ -9,9 +9,9 @@
 //! `mpv` with `--ao=pcm` taps decoded samples into a FIFO for the rustfft
 //! analyser without touching the speakers or media keys.
 //!
-//! On macOS we opt into `--input-media-keys` + `--macos-app-activation-policy`
-//! so Control Center / Now Playing pick the process up. On Linux the TUI also
-//! exports MPRIS; media keys here are a useful extra.
+//! On macOS we **disable** `--input-media-keys` so mpv does not steal Control
+//! Center / Now Playing from Tiders (souvlaki). A cocoa activation policy on
+//! mpv would register a second Now Playing identity named "mpv".
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,9 @@ struct Live {
     duration: AtomicU64,
     eof: AtomicBool,
     idle: AtomicBool,
+    paused: AtomicBool,
+    /// Unix millis when `time_pos` was last stamped (for interpolation).
+    pos_millis: AtomicU64,
     samplerate: AtomicU32,
     channels: AtomicU32,
     bit_depth: AtomicU32,
@@ -47,13 +50,22 @@ struct Live {
 }
 
 impl Live {
+    fn stamp_pos(&self, seconds: f64) {
+        self.time_pos.store(seconds.to_bits(), Ordering::Relaxed);
+        self.pos_millis.store(unix_millis(), Ordering::Relaxed);
+    }
+
     fn time_pos(&self) -> Option<f64> {
-        let bits = self.time_pos.load(Ordering::Relaxed);
-        if bits == 0 {
-            // 0.0 is a valid position at start; distinguish "never set" by
-            // also looking at duration/eof. Callers treat 0 as start.
+        let raw = f64::from_bits(self.time_pos.load(Ordering::Relaxed));
+        if self.paused.load(Ordering::Relaxed) {
+            return Some(raw);
         }
-        Some(f64::from_bits(bits))
+        let stamped = self.pos_millis.load(Ordering::Relaxed);
+        if stamped == 0 {
+            return Some(raw);
+        }
+        let extra = unix_millis().saturating_sub(stamped) as f64 / 1000.0;
+        Some(raw + extra.min(2.0))
     }
 
     fn duration(&self) -> Option<f64> {
@@ -136,8 +148,12 @@ impl MpvBackend {
             .arg("--idle=yes")
             .arg("--prefetch-playlist=yes")
             .arg("--gapless-audio=yes")
-            .arg("--input-media-keys=yes")
+            // Tiders owns Now Playing / MPRIS (souvlaki). If mpv also registers
+            // media keys it shows up as "mpv" with a combined title, no artist,
+            // no artwork, and next/prev bound to an empty playlist.
+            .arg("--input-media-keys=no")
             .arg("--force-window=no")
+            .arg("--audio-display=no")
             .arg(format!("--volume={}", self.volume))
             .arg(format!("--replaygain={}", self.replaygain))
             .arg("--replaygain-clip=yes")
@@ -150,8 +166,9 @@ impl MpvBackend {
 
         #[cfg(target_os = "macos")]
         {
+            // Headless audio only. Do **not** set macos-app-activation-policy —
+            // that creates an NSApplication named "mpv" and hijacks Now Playing.
             command.arg("--vo=null");
-            command.arg("--macos-app-activation-policy=accessory");
         }
 
         let child = command
@@ -182,6 +199,13 @@ impl MpvBackend {
     }
 
     fn spawn_vis(&mut self, gen: u64) {
+        // A second mpv decoding the same stream into a FIFO is expensive and
+        // was freezing the analyser. Opt in with TIDERS_PCM_VIS=1; otherwise
+        // the rustfft visualiser uses its synth fallback.
+        if std::env::var_os("TIDERS_PCM_VIS").is_none() {
+            let _ = gen;
+            return;
+        }
         #[cfg(unix)]
         {
             let _ = std::fs::remove_file(&self.vis_ipc);
@@ -284,7 +308,8 @@ impl AudioBackend for MpvBackend {
         self.started_file = true;
         self.live.eof.store(false, Ordering::Relaxed);
         self.live.idle.store(false, Ordering::Relaxed);
-        self.live.time_pos.store(0, Ordering::Relaxed);
+        self.live.paused.store(false, Ordering::Relaxed);
+        self.live.stamp_pos(0.0);
         if let Ok(mut pcm) = self.live.pcm.lock() {
             pcm.clear();
         }
@@ -297,6 +322,9 @@ impl AudioBackend for MpvBackend {
 
     fn pause(&mut self) -> Result<()> {
         if self.child.is_some() {
+            let pos = self.live.time_pos().unwrap_or(0.0);
+            self.live.paused.store(true, Ordering::Relaxed);
+            self.live.time_pos.store(pos.to_bits(), Ordering::Relaxed);
             let _ = self.send_command(&serde_json::json!(["set_property", "pause", true]));
             self.vis_cmd(&serde_json::json!(["set_property", "pause", true]));
         }
@@ -305,6 +333,8 @@ impl AudioBackend for MpvBackend {
 
     fn resume(&mut self) -> Result<()> {
         if self.child.is_some() {
+            self.live.paused.store(false, Ordering::Relaxed);
+            self.live.pos_millis.store(unix_millis(), Ordering::Relaxed);
             let _ = self.send_command(&serde_json::json!(["set_property", "pause", false]));
             self.vis_cmd(&serde_json::json!(["set_property", "pause", false]));
         }
@@ -361,9 +391,7 @@ impl AudioBackend for MpvBackend {
         if self.child.is_some() {
             let _ = self.send_command(&serde_json::json!(["seek", seconds, "absolute"]));
             self.vis_cmd(&serde_json::json!(["seek", seconds, "absolute"]));
-            self.live
-                .time_pos
-                .store(seconds.max(0.0).to_bits(), Ordering::Relaxed);
+            self.live.stamp_pos(seconds.max(0.0));
             if let Ok(mut pcm) = self.live.pcm.lock() {
                 pcm.clear();
             }
@@ -568,12 +596,12 @@ fn apply_ipc_event(live: &Live, v: &serde_json::Value) {
     let data = v.get("data");
     match name {
         "time-pos" => {
-            if let Some(p) = data.and_then(|d| d.as_f64()) {
-                live.time_pos.store(p.to_bits(), Ordering::Relaxed);
+            if let Some(p) = data.and_then(json_f64) {
+                live.stamp_pos(p);
             }
         }
         "duration" => {
-            if let Some(p) = data.and_then(|d| d.as_f64()) {
+            if let Some(p) = data.and_then(json_f64) {
                 live.duration.store(p.to_bits(), Ordering::Relaxed);
             }
         }
@@ -623,6 +651,19 @@ fn apply_ipc_event(live: &Live, v: &serde_json::Value) {
         }
         _ => {}
     }
+}
+
+fn json_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|i| i as f64))
+        .or_else(|| v.as_u64().map(|u| u as f64))
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn spawn_pcm_reader(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {

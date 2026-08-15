@@ -303,12 +303,51 @@ impl TidalService {
     }
 
     /// Timed lyrics for a track (empty if TIDAL has none).
+    ///
+    /// TIDAL puts synced LRC in `subtitles` and often leaves `lyrics` as plain
+    /// text. `tidlers::LyricsResponse` does not deserialize `subtitles` and
+    /// requires several fields, so a missing `providerCommontrackId` makes the
+    /// typed call fail on every track. We fetch the JSON ourselves and fall
+    /// back to the typed helper.
     pub async fn lyrics(&self, track_id: u64) -> Result<Vec<LyricLine>> {
         self.require_auth()?;
+        if let Ok(lines) = self.fetch_lyrics_json(track_id).await {
+            if !lines.is_empty() {
+                return Ok(lines);
+            }
+        }
         match self.client.get_track_lyrics(track_id.to_string()).await {
-            Ok(resp) => Ok(lyrics::parse_lrc(&resp.lyrics)),
+            Ok(resp) => Ok(lyrics::from_tidal(&resp.lyrics, None)),
             Err(_) => Ok(Vec::new()),
         }
+    }
+
+    async fn fetch_lyrics_json(&self, track_id: u64) -> Result<Vec<LyricLine>> {
+        let token = self
+            .client
+            .session
+            .auth
+            .access_token
+            .as_deref()
+            .ok_or(Error::NotAuthenticated)?;
+        let country = self.country().unwrap_or_else(|| "US".into());
+        let url =
+            format!("https://api.tidal.com/v1/tracks/{track_id}/lyrics?countryCode={country}");
+        let resp = reqwest::Client::new()
+            .get(url)
+            .bearer_auth(token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| Error::other(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let value: serde_json::Value =
+            resp.json().await.map_err(|e| Error::other(e.to_string()))?;
+        let lyrics = value.get("lyrics").and_then(|v| v.as_str()).unwrap_or("");
+        let subtitles = value.get("subtitles").and_then(|v| v.as_str());
+        Ok(lyrics::from_tidal(lyrics, subtitles))
     }
 
     /// Album tracks.

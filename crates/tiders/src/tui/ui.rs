@@ -3,7 +3,9 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use ratatui_image::{Resize, StatefulImage};
 
@@ -18,6 +20,7 @@ use super::app::{App, FavSection, LibSection, Popup, Screen, SearchScope, Tab, Q
 use super::theme;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.hits.clear();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme::BG)),
         frame.area(),
@@ -35,12 +38,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_browse(frame: &mut Frame, app: &mut App) {
+    let area = inset(frame.area(), 2, 1);
     let np = super::anim::ease_out_cubic(app.np_progress.clamp(0.0, 1.0));
     // Interpolate the now-playing pane from a compact bar to a fullscreen stage.
-    let compact = 7.0;
-    let stage = (frame.area().height as f32 * 0.72).max(18.0);
+    let compact = 8.0;
+    let stage = (area.height as f32 * 0.72).max(18.0);
     let np_h = super::anim::lerp(compact, stage, np).round() as u16;
-    let list_min = frame.area().height.saturating_sub(np_h + 3).max(3);
+    let list_min = area.height.saturating_sub(np_h + 3).max(3);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -51,7 +55,7 @@ fn draw_browse(frame: &mut Frame, app: &mut App) {
             Constraint::Length(np_h),
             Constraint::Length(1),
         ])
-        .split(frame.area());
+        .split(area);
 
     draw_header(frame, app, chunks[0]);
     draw_tabs(frame, app, chunks[1]);
@@ -108,7 +112,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.input_mode {
         let label = if app.tab == Tab::Search && app.nav.is_empty() {
             "  Search  "
@@ -135,18 +139,29 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut spans = Vec::new();
-    for tab in [Tab::Search, Tab::Library, Tab::Favorites, Tab::Queue] {
+    let mut x = area.x;
+    for tab in [
+        Tab::Search,
+        Tab::Library,
+        Tab::Mixes,
+        Tab::Favorites,
+        Tab::Queue,
+    ] {
         let selected = app.tab == tab && app.nav.is_empty();
         let (fg, modifier) = if selected {
             (theme::ACCENT, Modifier::BOLD)
         } else {
             (theme::DIM, Modifier::empty())
         };
+        let label = format!("  {}  ", tab.title());
+        let w = label.chars().count() as u16;
+        app.hits.tabs.push((Rect::new(x, area.y, w, 1), tab));
         spans.push(Span::styled(
-            format!("  {}  ", tab.title()),
+            label,
             Style::default().fg(fg).add_modifier(modifier),
         ));
         spans.push(Span::styled("│", Style::default().fg(theme::BORDER)));
+        x = x.saturating_add(w + 1);
     }
     if !app.nav.is_empty() {
         spans.push(Span::styled(
@@ -158,26 +173,40 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.tab == Tab::Library {
         for sec in [LibSection::Playlists, LibSection::Mixes, LibSection::ForYou] {
             let on = app.lib_section == sec;
+            let label = format!(" {} ", sec.title());
+            let w = label.chars().count() as u16;
+            app.hits.lib.push((Rect::new(x, area.y, w, 1), sec));
             spans.push(Span::styled(
-                format!(" {} ", sec.title()),
+                label,
                 if on {
-                    Style::default().fg(theme::ACCENT2)
+                    Style::default()
+                        .fg(theme::BG)
+                        .bg(theme::ACCENT2)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    theme::dim()
+                    Style::default().fg(theme::ACCENT2)
                 },
             ));
+            x = x.saturating_add(w);
         }
     } else if app.tab == Tab::Favorites {
         for sec in [FavSection::Tracks, FavSection::Albums, FavSection::Artists] {
             let on = app.fav_section == sec;
+            let label = format!(" {} ", sec.title());
+            let w = label.chars().count() as u16;
+            app.hits.fav.push((Rect::new(x, area.y, w, 1), sec));
             spans.push(Span::styled(
-                format!(" {} ", sec.title()),
+                label,
                 if on {
-                    Style::default().fg(theme::ACCENT2)
+                    Style::default()
+                        .fg(theme::BG)
+                        .bg(theme::ACCENT2)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    theme::dim()
+                    Style::default().fg(theme::ACCENT2)
                 },
             ));
+            x = x.saturating_add(w);
         }
     } else if app.tab == Tab::Search {
         spans.push(Span::styled(
@@ -185,6 +214,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::ACCENT2),
         ));
     }
+    let _ = x;
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -203,7 +233,12 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border_focused())
+        .padding(Padding::horizontal(1))
         .title(Span::styled(title, theme::accent()));
+
+    let inner = block.inner(area);
+    app.hits.list = Some(inner);
+    app.hits.list_offset = app.list_state.offset();
 
     if app.current_len() == 0 {
         let hint = empty_hint(app);
@@ -258,6 +293,7 @@ fn empty_hint(app: &App) -> String {
         Tab::Library => {
             "Library is empty — playlists, mixes and For You load after sign-in.".into()
         }
+        Tab::Mixes => "No mixes yet — they load after sign-in. Click Mixes or press 3.".into(),
         Tab::Favorites => "No favorites loaded — press f to reload.".into(),
         Tab::Queue => "The queue is empty — pick a track and press Enter to play.".into(),
     }
@@ -319,6 +355,14 @@ fn collection_rows(app: &App) -> Vec<ListItem<'static>> {
                 )
             }),
         },
+        Tab::Mixes => map_visible(&app.mixes, app, |m, hit| {
+            row(
+                &m.title,
+                &m.subtitle,
+                "mix",
+                hit_title_indices(m.title.len(), hit),
+            )
+        }),
         Tab::Favorites => match app.fav_section {
             FavSection::Albums => map_visible(&app.fav_albums, app, |a, hit| {
                 row(
@@ -456,6 +500,7 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(theme::border())
+        .padding(Padding::horizontal(1))
         .title(Span::styled(" Now Playing ", theme::dim()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -517,30 +562,7 @@ fn draw_now_playing(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             let total = track.duration_secs as f64;
-            let bar_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(6),
-                    Constraint::Min(6),
-                    Constraint::Length(6),
-                ])
-                .split(rows[2]);
-            frame.render_widget(
-                Paragraph::new(Span::styled(format::duration(elapsed as u64), theme::dim())),
-                bar_cols[0],
-            );
-            frame.render_widget(
-                Gauge::default()
-                    .gauge_style(Style::default().fg(theme::ACCENT).bg(theme::SURFACE))
-                    .ratio(progress)
-                    .label(""),
-                bar_cols[1],
-            );
-            frame.render_widget(
-                Paragraph::new(Span::styled(format::duration(total as u64), theme::dim()))
-                    .alignment(Alignment::Right),
-                bar_cols[2],
-            );
+            draw_scrub(frame, app, rows[2], elapsed, total, progress);
 
             let pos = match snap.queue_position {
                 Some(i) if snap.queue_len > 0 => format!("{}/{}", i + 1, snap.queue_len),
@@ -677,16 +699,13 @@ fn draw_now_playing_stage(frame: &mut Frame, app: &mut App, area: Rect) {
             ]),
             mid[0],
         );
-        frame.render_widget(
-            Gauge::default()
-                .gauge_style(Style::default().fg(theme::ACCENT).bg(theme::SURFACE))
-                .ratio(progress)
-                .label(format!(
-                    "{} / {}",
-                    format::duration(elapsed as u64),
-                    format::duration(track.duration_secs)
-                )),
+        draw_scrub(
+            frame,
+            app,
             mid[1],
+            elapsed,
+            track.duration_secs as f64,
+            progress,
         );
         draw_lyrics(frame, app, elapsed, mid[2]);
     } else {
@@ -839,6 +858,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         &[
             ("/", "filter"),
+            ("3", "mixes"),
             ("↵", "play"),
             ("Spc", "pause"),
             ("s", "shuffle"),
@@ -919,7 +939,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "/",
             "filter the current list (FFF) — Enter searches the catalog",
         ),
-        ("Tab / 1–4", "Search · Library · Favorites · Queue"),
+        ("Tab / 1–5", "Search · Library · Mixes · Favorites · Queue"),
         ("t / S", "cycle search scope / library-favorites section"),
         ("Enter", "play or open the highlighted item"),
         ("a / A", "add track / add all to queue"),
@@ -935,6 +955,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("Q", "streaming quality"),
         ("x", "stop"),
         ("Esc", "back / close"),
+        (
+            "click",
+            "tabs / sections / row (second click plays); drag to seek",
+        ),
         ("q", "quit"),
     ];
     let mut lines = vec![Line::from("")];
@@ -1053,21 +1077,33 @@ fn draw_toast(frame: &mut Frame, app: &mut App) {
     let Some(toast) = app.toast.as_ref() else {
         return;
     };
-    let text = format::truncate(&toast.message, 42);
+    let title = format::truncate(&toast.title, 36);
+    let subtitle = toast.subtitle.as_ref().map(|s| format::truncate(s, 36));
     let has_art = toast.art.is_some();
-    let w = (text.chars().count() as u16) + 4 + if has_art { 8 } else { 0 };
-    let h = if has_art { 5 } else { 3 };
+    let w = {
+        let tw = title.chars().count();
+        let sw = subtitle.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+        ((tw.max(sw) as u16) + 4 + if has_art { 8 } else { 0 }).clamp(18, 48)
+    };
+    let h = if has_art {
+        5
+    } else if subtitle.is_some() {
+        4
+    } else {
+        3
+    };
     let full = frame.area();
-    if full.width < w + 2 || full.height < h + 2 {
+    if full.width < w + 4 || full.height < h + 3 {
         return;
     }
     let area = Rect::new(
-        full.width.saturating_sub(w + 1),
-        full.height.saturating_sub(h + 1),
+        full.width.saturating_sub(w + 3),
+        full.height.saturating_sub(h + 2),
         w,
         h,
     );
     let fg = theme::blend(theme::YELLOW, theme::SURFACE, 1.0 - alpha);
+    let sub_fg = theme::blend(theme::ACCENT2, theme::SURFACE, 1.0 - alpha);
     let border = theme::blend(theme::ACCENT, theme::SURFACE, 1.0 - alpha);
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -1077,6 +1113,15 @@ fn draw_toast(frame: &mut Frame, app: &mut App) {
         .style(Style::default().bg(theme::SURFACE));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    let mut text_lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(sub) = subtitle {
+        text_lines.push(Line::from(Span::styled(sub, Style::default().fg(sub_fg))));
+    }
+
     if has_art {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -1090,13 +1135,12 @@ fn draw_toast(frame: &mut Frame, app: &mut App) {
             );
         }
         frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(fg))).alignment(Alignment::Left),
+            Paragraph::new(text_lines).alignment(Alignment::Left),
             cols[1],
         );
     } else {
         frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(fg)))
-                .alignment(Alignment::Center),
+            Paragraph::new(text_lines).alignment(Alignment::Center),
             inner,
         );
     }
@@ -1196,6 +1240,69 @@ fn draw_login(frame: &mut Frame, app: &App) {
 fn spinner(tick: u64) -> String {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     FRAMES[(tick as usize / 4) % FRAMES.len()].to_string()
+}
+
+/// Compact scrubber: `0:12 ──●──────── 3:45` capped at 28 bar cells so it
+/// doesn't span the whole pane and jump a cell every second.
+fn draw_scrub(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    elapsed: f64,
+    total: f64,
+    progress: f64,
+) {
+    if area.width < 12 {
+        return;
+    }
+    let elapsed_s = format::duration(elapsed.max(0.0) as u64);
+    let total_s = format::duration(total.max(0.0) as u64);
+    let time_w = elapsed_s.len().max(total_s.len()).max(4) as u16;
+    let bar_budget = area.width.saturating_sub(time_w * 2 + 2);
+    let bar_w = bar_budget.clamp(8, 28);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(time_w),
+            Constraint::Length(bar_w),
+            Constraint::Length(time_w + 1),
+        ])
+        .split(area);
+    app.hits.progress = Some(cols[1]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(elapsed_s, theme::dim())),
+        cols[0],
+    );
+    frame.render_widget(Paragraph::new(scrub_bar(progress, bar_w as usize)), cols[1]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(format!(" {total_s}"), theme::dim()))
+            .alignment(Alignment::Right),
+        cols[2],
+    );
+}
+
+fn scrub_bar(progress: f64, width: usize) -> Line<'static> {
+    let progress = progress.clamp(0.0, 1.0);
+    if width == 0 {
+        return Line::from("");
+    }
+    let pos = ((progress * (width.saturating_sub(1)) as f64).round() as usize).min(width - 1);
+    let mut spans = Vec::with_capacity(width);
+    for i in 0..width {
+        if i == pos {
+            spans.push(Span::styled(
+                "●",
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if i < pos {
+            spans.push(Span::styled("─", Style::default().fg(theme::ACCENT)));
+        } else {
+            spans.push(Span::styled("─", theme::dim()));
+        }
+    }
+    Line::from(spans)
 }
 
 fn marquee(text: &str, width: usize, tick: u64, animate: bool) -> String {

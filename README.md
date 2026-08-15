@@ -22,24 +22,29 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
 ## Features
 
 - **Interactive TUI** — a fullscreen, themed terminal UI (built with
-  [ratatui](https://ratatui.rs)) with search, library, favorites, a play queue,
-  and a now‑playing stage. Visual design and the **120 Hz** frame loop take cues
-  from [xai-org/grok-build](https://github.com/xai-org/grok-build).
+  [ratatui](https://ratatui.rs)) with search, library, **Mixes**, favorites, a
+  play queue, and a now‑playing stage. Mouse clicks select tabs, sections, and
+  rows (a second click plays); drag the scrubber to seek. Animations target
+  **120 Hz** while something is moving (toasts, layout morphs) and drop to a
+  slower redraw while a track is simply playing, so the terminal does not sit
+  on ~30% CPU.
 - **Live filter** — `/` fuzzy-filters the current view (library, mixes, playlists,
   favorites, queue, album tracks) with the SIMD matcher from
   [FFF](https://github.com/dmtrKovalenko/fff) (`neo_frizbee`). Typo-resistant,
   ranked as you type, with match highlighting. On the Search tab, **Enter** still
   queries the TIDAL catalog.
 - **Library** — your playlists, **My Mixes**, and TIDAL **For You** cards, plus
-  album / artist / playlist drill‑down (bio included).
+  album / artist / playlist drill‑down (bio included). Mixes also have their
+  own tab (`3`).
 - **Favorites** — saved tracks, albums, and artists; love / unlove syncs with
   TIDAL (`l`).
 - **Now‑playing mode** — press `m` for a large cover, synced lyrics, a mini
   queue, and the spectrum (`Esc` back).
 - **Real FFT spectrum** — [rustfft](https://crates.io/crates/rustfft) analyser
-  with cava‑style gravity, peak hold, and EQ themes (`e` / `E`). Decoded PCM is
-  tapped from a silent mpv `--ao=pcm` sidecar so the bars track the actual
-  stream (with a seeded synth fallback before the tap is ready).
+  with cava‑style gravity, peak hold, and EQ themes (`e` / `E`). By default the
+  bars are synthesised from the playing track so a second mpv process is not
+  needed. Set `TIDERS_PCM_VIS=1` to tap decoded PCM from a silent
+  `--ao=pcm` sidecar.
 - **Stream quality** — live decoder details (FLAC / AAC, bit depth, kHz, kbps)
   from TIDAL’s manifest plus mpv’s `audio-params`.
 - **Shuffle & repeat** — shuffle off / random / favourites / discovery (`s`);
@@ -48,15 +53,16 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
 - **Queue** — add a track (`a`) or the whole view (`A`) without interrupting
   playback; the queue persists across restarts. Track radio with `R`.
 - **OS media controls** — **MPRIS** on Linux (`playerctl`, GNOME/KDE applets,
-  Noctalia) and **Now Playing / media keys** on macOS (via a long‑lived mpv
-  plus the platform media session).
-- **Toasts with album art** — fade‑out status toasts carry the current cover.
+  Noctalia) and **Now Playing / media keys** on macOS. Tiders owns the session
+  (title, artist, cover, next/prev). mpv is told not to register media keys so
+  Control Center does not show a combined “Artist — Title” under **mpv**.
+- **Toasts** — now‑playing toasts show title, artist, and cover; settings
+  toasts (repeat, shuffle, volume) are text‑only.
 - **Inline album art** — cover art rendered via
   [ratatui-image](https://crates.io/crates/ratatui-image): kitty/sixel/iTerm2,
   with a unicode half‑block fallback.
 - **Smooth animation** — time‑based easing (not tick-counted frames) for
-  popups, the now‑playing layout, marquee, and toasts. The loop targets **120 Hz**
-  while something is moving (playback, spectrum, toasts) and parks when idle,
+  popups, the now‑playing layout, marquee, and toasts. The loop parks when idle,
   with terminal synchronized updates so frames don't tear. Input runs on its own
   OS thread so the UI never blocks on mpv IPC.
 - **Scriptable CLI** — `login`, `search`, `play`, `favorites`, `playlists`,
@@ -216,7 +222,8 @@ library. Keys:
 | Key | Action |
 |-----|--------|
 | `/` | live-filter the current list (playlists, mixes, favorites, queue, …). On Search, **Enter** also queries the TIDAL catalog |
-| `Tab` / `1` `2` `3` `4` | Search · Library · Favorites · Queue |
+| `Tab` / `1` `2` `3` `4` `5` | Search · Library · Mixes · Favorites · Queue |
+| click / drag | click a tab, section, or row (second click on the same row plays); drag the scrubber to seek; wheel moves the selection |
 | `t` | cycle search scope (tracks / albums / artists / playlists) |
 | `S` | cycle Library or Favorites section |
 | `↑`/`↓` or `k`/`j` | move selection |
@@ -272,6 +279,9 @@ Album art auto‑detects the terminal's image protocol; force one with
 `TIDERS_IMAGE_PROTOCOL=halfblocks|sixel|kitty|iterm2` (half‑blocks works
 everywhere).
 
+Set `TIDERS_PCM_VIS=1` to spawn a second silent mpv that feeds real PCM into
+the spectrum analyser. Leave it unset (the default) to keep CPU down.
+
 For headless/CI use, a full session JSON can be supplied via the
 `TIDAL_SESSION_JSON` environment variable; Tiders restores and persists it on
 first use. On machines without an audio device (CI, servers), set
@@ -293,7 +303,11 @@ Releases are automated with [release-plz](https://release-plz.dev) from
    updates [`CHANGELOG.md`](CHANGELOG.md).
 2. Merging that PR tags `vX.Y.Z`.
 3. The existing tag workflow builds Linux/macOS archives and publishes a
-   **GitHub Release** with those binaries.
+   **GitHub Release** with those binaries. The same workflow also runs
+   `nix build` / `nix flake check` through
+   [cachix/cachix-action](https://github.com/cachix/cachix-action) against the
+   `tiders` binary cache (`CACHIX_AUTH_TOKEN`). A missing token does not block
+   the GitHub Release.
 
 This does **not** run `cargo publish`. To allow the release PR, enable
 **Allow GitHub Actions to create and approve pull requests** under

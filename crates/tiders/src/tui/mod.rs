@@ -4,6 +4,7 @@ mod anim;
 mod app;
 mod art;
 mod filter;
+mod hits;
 mod theme;
 mod ui;
 
@@ -16,7 +17,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
@@ -25,12 +29,12 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
-use tokio::time::{interval, MissedTickBehavior};
 
 use tiders_core::config::Config;
 
 use app::{Popup, Screen, Tab, FRAME};
 use art::ArtManager;
+use hits::Hit;
 
 /// Launch the TUI against the given config, restoring the terminal on exit.
 pub async fn run(config: Config) -> Result<()> {
@@ -39,14 +43,18 @@ pub async fn run(config: Config) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -54,19 +62,19 @@ pub async fn run(config: Config) -> Result<()> {
 
 /// Dedicated OS thread for input — grok-build's workaround for crossterm
 /// stranding `EventStream` wakers when the future is dropped inside `select!`.
-fn spawn_input_thread(tx: mpsc::UnboundedSender<KeyEvent>, stop: Arc<AtomicBool>) {
+fn spawn_input_thread(tx: mpsc::UnboundedSender<Event>, stop: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("tiders-input".into())
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 match crossterm::event::poll(Duration::from_millis(16)) {
                     Ok(true) => match crossterm::event::read() {
-                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                            if tx.send(key).is_err() {
+                        Ok(Event::Key(key)) if key.kind != KeyEventKind::Press => {}
+                        Ok(ev) => {
+                            if tx.send(ev).is_err() {
                                 break;
                             }
                         }
-                        Ok(_) => {}
                         Err(_) => break,
                     },
                     Ok(false) => {}
@@ -85,8 +93,6 @@ async fn event_loop<B: ratatui::backend::Backend + Write>(
     let stop = Arc::new(AtomicBool::new(false));
     spawn_input_thread(key_tx, Arc::clone(&stop));
 
-    let mut frames = interval(FRAME);
-    frames.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last = Instant::now();
     let mut last_idle_draw = Instant::now();
     let mut dirty = true;
@@ -99,23 +105,39 @@ async fn event_loop<B: ratatui::backend::Backend + Write>(
             dirty = false;
         }
 
+        // 120 Hz only while something is animating. Playback used to pin the
+        // loop there (~30% CPU in the terminal) even with nothing moving.
+        let wait = if app.needs_frames() {
+            FRAME
+        } else {
+            app.playback_redraw_every()
+        };
+
         tokio::select! {
             biased;
             maybe = key_rx.recv() => {
                 match maybe {
-                    Some(key) => {
+                    Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         handle_key(app, key).await;
                         dirty = true;
                     }
+                    Some(Event::Mouse(mouse)) => {
+                        handle_mouse(app, mouse).await;
+                        dirty = true;
+                    }
+                    Some(Event::Resize(_, _)) => {
+                        dirty = true;
+                    }
+                    Some(_) => {}
                     None => break Ok(()),
                 }
             }
-            _ = frames.tick() => {
+            _ = tokio::time::sleep(wait) => {
                 let now = Instant::now();
                 let dt = now.saturating_duration_since(last).as_secs_f32();
                 last = now;
                 app.on_frame(dt).await;
-                if app.needs_frames() || last_idle_draw.elapsed() >= Duration::from_millis(250) {
+                if app.needs_frames() || last_idle_draw.elapsed() >= app.playback_redraw_every() {
                     dirty = true;
                     last_idle_draw = now;
                 }
@@ -248,8 +270,9 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('1') => app.set_tab(Tab::Search),
         KeyCode::Char('2') => app.set_tab(Tab::Library),
-        KeyCode::Char('3') => app.set_tab(Tab::Favorites),
-        KeyCode::Char('4') => app.set_tab(Tab::Queue),
+        KeyCode::Char('3') => app.set_tab(Tab::Mixes),
+        KeyCode::Char('4') => app.set_tab(Tab::Favorites),
+        KeyCode::Char('5') => app.set_tab(Tab::Queue),
         KeyCode::Char('t') => {
             if app.tab == Tab::Search && app.nav.is_empty() {
                 app.search_scope = app.search_scope.cycle();
@@ -297,6 +320,60 @@ async fn handle_browse_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('f') => {
             app.load_library().await;
             app.set_tab(Tab::Favorites);
+        }
+        _ => {}
+    }
+}
+
+async fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.screen != Screen::Browse {
+        return;
+    }
+    if app.popup_open() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.close_popup();
+        }
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.move_selection(-1),
+        MouseEventKind::ScrollDown => app.move_selection(1),
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(hit) = app.hits.at(mouse.column, mouse.row) else {
+                return;
+            };
+            match hit {
+                Hit::Tab(tab) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.set_tab(tab);
+                    }
+                }
+                Hit::Lib(sec) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.set_lib_section(sec);
+                    }
+                }
+                Hit::Fav(sec) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.set_fav_section(sec);
+                    }
+                }
+                Hit::ListRow(i) => {
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        let already = app.list_state.selected() == Some(i);
+                        app.select_index(i);
+                        if already {
+                            app.activate().await;
+                        }
+                    }
+                }
+                Hit::Progress => {
+                    if let Some(ratio) = app.hits.progress_ratio(mouse.column) {
+                        app.seek_ratio(ratio);
+                    }
+                }
+            }
         }
         _ => {}
     }
