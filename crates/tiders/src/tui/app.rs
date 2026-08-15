@@ -476,17 +476,14 @@ impl App {
 
     fn publish_media(&mut self) {
         let track = self.player.now_playing().cloned();
-        let cover_url = self.media_cover_url.clone().or_else(|| {
-            // Linux MPRIS can fetch HTTP; macOS Now Playing cannot.
-            #[cfg(target_os = "linux")]
-            {
-                track.as_ref().and_then(|t| t.cover_url(320))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                None
-            }
-        });
+        // Linux MPRIS can fetch HTTP covers; macOS Now Playing cannot (ATS).
+        #[cfg(target_os = "linux")]
+        let cover_url = self
+            .media_cover_url
+            .clone()
+            .or_else(|| track.as_ref().and_then(|t| t.cover_url(320)));
+        #[cfg(not(target_os = "linux"))]
+        let cover_url = self.media_cover_url.clone();
         let position = Duration::from_secs_f64(self.elapsed_secs());
         let np = MediaNowPlaying {
             status: self.player.status(),
