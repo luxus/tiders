@@ -464,15 +464,15 @@ fn unique_path(kind: &str, ext: &str) -> PathBuf {
 
 #[cfg(unix)]
 fn mkfifo(path: &Path) -> std::io::Result<()> {
-    let status = Command::new("mkfifo")
-        .arg("-m")
-        .arg("600")
-        .arg(path)
-        .status()?;
-    if status.success() {
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "fifo path contains NUL")
+    })?;
+    let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
+    if rc == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::other("mkfifo failed"))
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -731,4 +731,27 @@ fn send_ipc(
     _wait: Option<Duration>,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Null)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::mkfifo;
+    use std::os::unix::fs::FileTypeExt;
+
+    #[test]
+    fn mkfifo_creates_a_named_pipe() {
+        let path = std::env::temp_dir().join(format!(
+            "tiders-mkfifo-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        mkfifo(&path).expect("libc mkfifo");
+        let meta = std::fs::metadata(&path).expect("stat fifo");
+        assert!(meta.file_type().is_fifo());
+        let _ = std::fs::remove_file(&path);
+    }
 }

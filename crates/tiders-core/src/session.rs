@@ -488,20 +488,35 @@ impl TidalService {
 
 fn strip_simple_html(s: String) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            out.push(c);
+            continue;
+        }
+        let mut tag = String::new();
+        for t in chars.by_ref() {
+            if t == '>' {
+                break;
+            }
+            tag.push(t);
+        }
+        let name = tag
+            .trim()
+            .trim_end_matches('/')
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name == "br" {
+            out.push('\n');
         }
     }
-    out.replace("&amp;", "&")
+    out.replace("&nbsp;", " ")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
-        .replace("&nbsp;", " ")
-        .replace("<br/>", "\n")
+        .replace("&amp;", "&")
 }
 
 fn collect_home_item(
@@ -675,5 +690,25 @@ mod tests {
             .block_on(TidalService::restore(cfg, Quality::Lossless))
             .unwrap();
         assert!(restored.is_none());
+    }
+
+    #[test]
+    fn strip_html_keeps_line_breaks_and_entities() {
+        assert_eq!(
+            strip_simple_html("Verse one<br/>Verse two".into()),
+            "Verse one\nVerse two"
+        );
+        assert_eq!(
+            strip_simple_html("a<br>b<br />c".into()),
+            "a\nb\nc"
+        );
+        assert_eq!(
+            strip_simple_html("<p>hi &amp; lo</p>".into()),
+            "hi & lo"
+        );
+        assert_eq!(
+            strip_simple_html("a<br class=\"x\">b".into()),
+            "a\nb"
+        );
     }
 }

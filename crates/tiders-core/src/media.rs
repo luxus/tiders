@@ -48,7 +48,6 @@ pub struct MediaBridge {
 struct Inner {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     controls: souvlaki::MediaControls,
-    tx: Sender<MediaCommand>,
 }
 
 impl MediaBridge {
@@ -111,7 +110,6 @@ impl MediaBridge {
                 });
             }
         }
-        let _ = inner.tx;
     }
 }
 
@@ -126,7 +124,6 @@ fn attach(tx: Sender<MediaCommand>) -> Option<Inner> {
             hwnd,
         };
         let mut controls = MediaControls::new(config).ok()?;
-        let tx_ev = tx.clone();
         controls
             .attach(move |event| {
                 let cmd = match event {
@@ -155,10 +152,10 @@ fn attach(tx: Sender<MediaCommand>) -> Option<Inner> {
                     },
                     _ => return,
                 };
-                let _ = tx_ev.send(cmd);
+                let _ = tx.send(cmd);
             })
             .ok()?;
-        Some(Inner { controls, tx })
+        Some(Inner { controls })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

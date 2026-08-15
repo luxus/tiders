@@ -1292,8 +1292,17 @@ impl App {
 
     fn persist_queue(&self) {
         let path = self.config.queue_path();
-        if let Ok(raw) = serde_json::to_string(self.player.queue()) {
-            let _ = self.config.ensure_dir();
+        let Ok(raw) = serde_json::to_string(self.player.queue()) else {
+            return;
+        };
+        let _ = self.config.ensure_dir();
+        // Keep the 120 Hz loop off the filesystem: serialize on the UI thread
+        // (tiny JSON) and write from a blocking worker.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _ = std::fs::write(path, raw);
+            });
+        } else {
             let _ = std::fs::write(path, raw);
         }
     }

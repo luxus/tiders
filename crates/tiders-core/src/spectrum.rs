@@ -100,12 +100,16 @@ pub struct SpectrumFrame {
 pub struct Spectrum {
     fft: Arc<dyn Fft<f32>>,
     scratch: Vec<Complex<f32>>,
+    /// Reused FFT input/output so `tick` does not allocate at 120 Hz.
+    fft_buf: Vec<Complex<f32>>,
     window: Vec<f32>,
     pcm: Vec<f32>,
     pcm_len: usize,
     mags: Vec<f32>,
     /// Instantaneous FFT band energy (target for gravity).
     levels: Vec<f32>,
+    /// Scratch for the horizontal smear pass.
+    smear: Vec<f32>,
     bars: Vec<f32>,
     peaks: Vec<f32>,
     peak_age: Vec<f32>,
@@ -128,11 +132,13 @@ impl Spectrum {
         Self {
             fft,
             scratch,
+            fft_buf: vec![Complex::new(0.0, 0.0); FFT_SIZE],
             window,
             pcm: vec![0.0; FFT_SIZE],
             pcm_len: 0,
             mags: vec![0.0; FFT_SIZE / 2],
             levels: vec![0.0; n_bars],
+            smear: vec![0.0; n_bars],
             bars: vec![0.0; n_bars],
             peaks: vec![0.0; n_bars],
             peak_age: vec![0.0; n_bars],
@@ -150,6 +156,7 @@ impl Spectrum {
         }
         self.n_bars = n_bars;
         self.levels.resize(n_bars, 0.0);
+        self.smear.resize(n_bars, 0.0);
         self.bars.resize(n_bars, 0.0);
         self.peaks.resize(n_bars, 0.0);
         self.peak_age.resize(n_bars, 0.0);
@@ -252,14 +259,15 @@ impl Spectrum {
         if self.pcm_len < FFT_SIZE / 4 {
             return;
         }
-        let mut buf: Vec<Complex<f32>> = (0..FFT_SIZE)
-            .map(|i| Complex::new(self.pcm[i] * self.window[i], 0.0))
-            .collect();
-        self.fft.process_with_scratch(&mut buf, &mut self.scratch);
+        for i in 0..FFT_SIZE {
+            self.fft_buf[i] = Complex::new(self.pcm[i] * self.window[i], 0.0);
+        }
+        self.fft
+            .process_with_scratch(&mut self.fft_buf, &mut self.scratch);
         let scale = 2.0 / FFT_SIZE as f32;
         for i in 0..self.mags.len() {
-            let re = buf[i].re * scale;
-            let im = buf[i].im * scale;
+            let re = self.fft_buf[i].re * scale;
+            let im = self.fft_buf[i].im * scale;
             // Magnitude → dB-ish with a floor, then 0..1.
             let mag = (re * re + im * im).sqrt();
             let db = 20.0 * (mag + 1e-9).log10();
@@ -294,7 +302,6 @@ impl Spectrum {
         }
         // Monstercat-style horizontal smear.
         if self.n_bars > 2 {
-            let mut smeared = self.levels.clone();
             for i in 0..self.n_bars {
                 let mut v = self.levels[i];
                 if i > 0 {
@@ -303,9 +310,9 @@ impl Spectrum {
                 if i + 1 < self.n_bars {
                     v = v.max(self.levels[i + 1] / SMOOTH);
                 }
-                smeared[i] = v;
+                self.smear[i] = v;
             }
-            self.levels = smeared;
+            self.levels.copy_from_slice(&self.smear);
         }
     }
 

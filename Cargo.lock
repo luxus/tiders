@@ -2906,6 +2906,7 @@ name = "tiders-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "rand 0.8.7",
  "reqwest",
  "rustfft",
