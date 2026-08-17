@@ -542,6 +542,10 @@ mod tests {
             "440 Hz mag peak at unexpected band {idx}: {:?}",
             frame.bars
         );
-        assert!(frame.bars[idx] > 0.15, "peak too quiet: {}", frame.bars[idx]);
+        assert!(
+            frame.bars[idx] > 0.15,
+            "peak too quiet: {}",
+            frame.bars[idx]
+        );
     }
 }
