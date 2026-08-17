@@ -72,9 +72,14 @@ pub trait AudioBackend: Send {
 
     /// Append recently decoded PCM samples (mono `f32`, ~44.1 kHz) into `dst`.
     ///
-    /// Default is a no-op. The mpv backend drains a FIFO tap filled by a silent
-    /// `--ao=pcm` sidecar so the rustfft analyser sees real audio.
+    /// Default is a no-op. Prefer [`AudioBackend::drain_fft_bins`] when the
+    /// backend taps a same-process spectrum; this remains for synthetic PCM.
     fn drain_pcm(&mut self, dst: &mut Vec<f32>) {
+        dst.clear();
+    }
+
+    /// Linear frequency-bin levels (`0..=1`) from the playback-clock vis tap.
+    fn drain_fft_bins(&mut self, dst: &mut Vec<f32>) {
         dst.clear();
     }
 }
