@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Spectrum visualiser PCM tap is locked to the main player's clock instead of
-  wall-time from when the silent sidecar started, so bars match the audible
-  position (including seek / pause).
+- Spectrum visualiser taps `showfreqs` from the **same** mpv that plays to the
+  speakers (`asplit` + `video-sync=audio`) instead of a second `--ao=pcm`
+  decoder. The extra process could not stay on the audible clock, so bars
+  drifted from the music after buffering, pause, or seek.
 - Direct and DASH downloads stream HTTP bodies to a sibling `.part` file
   instead of buffering the whole track in memory.
 - `DownloadPlaylist` errors on an empty playlist, matching `PlayPlaylist`.

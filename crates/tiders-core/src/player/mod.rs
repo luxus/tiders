@@ -10,6 +10,7 @@
 
 mod backend;
 mod mpv;
+mod vis;
 
 pub use backend::{AudioBackend, NullBackend};
 pub use mpv::MpvBackend;
@@ -315,6 +316,13 @@ impl Player {
     pub fn drain_pcm(&mut self) -> Vec<f32> {
         let mut dst = Vec::new();
         self.backend.drain_pcm(&mut dst);
+        dst
+    }
+
+    /// Drain linear spectrum bins from the playback-clock vis tap.
+    pub fn drain_fft_bins(&mut self) -> Vec<f32> {
+        let mut dst = Vec::new();
+        self.backend.drain_fft_bins(&mut dst);
         dst
     }
 

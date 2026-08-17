@@ -43,8 +43,10 @@ stream shape TIDAL returns (direct FLAC, DASH, HLS) on both platforms.
   press `m` for a large cover, synced lyrics, and a clickable scrollable queue
   (`Esc` back).
 - **Real FFT spectrum** — [rustfft](https://crates.io/crates/rustfft) analyser
-  with cava‑style gravity and peak hold. Bars follow decoded PCM from the
-  silent `--ao=pcm` sidecar and fall to zero on silence, pause, or a stale tap.
+  with cava‑style gravity and peak hold. Bars are driven from a `showfreqs` tap
+  inside the **same** mpv that plays to the speakers (`video-sync=audio`), so
+  they stay on the audible clock. They fall to zero on silence, pause, or a
+  stale tap.
 - **Stream quality** — live decoder details (FLAC / AAC, bit depth, kHz, kbps)
   from TIDAL’s manifest plus mpv’s `audio-params`.
 - **Shuffle & repeat** — shuffle off / random / favourites / discovery (`s`);
@@ -308,8 +310,8 @@ Album art auto‑detects the terminal's image protocol; force one with
 `TIDERS_IMAGE_PROTOCOL=halfblocks|sixel|kitty|iterm2` (half‑blocks works
 everywhere).
 
-Set `TIDERS_PCM_VIS=0` to skip the silent PCM sidecar if you want to save a
-process; the spectrum then stays at rest instead of inventing motion.
+Set `TIDERS_PCM_VIS=0` to skip the spectrum tap if you want to save a little
+CPU; the analyser then stays at rest instead of following the playing track.
 
 For headless/CI use, a full session JSON can be supplied via the
 `TIDAL_SESSION_JSON` environment variable; Tiders restores and persists it on

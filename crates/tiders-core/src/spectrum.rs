@@ -1,9 +1,10 @@
 //! Real FFT spectrum analyser (cava-style gravity + peak hold).
 //!
-//! Incoming PCM is windowed (Hann), transformed with [`rustfft`], then folded
-//! into log-spaced bands from ~20 Hz to Nyquist. Bars only rise on **fresh**
-//! decoded PCM; silence, pause, or a stale tap lets cava-style gravity pull
-//! them down instead of inventing a synth fallback.
+//! Incoming PCM is Hann-windowed and transformed with [`rustfft`], then folded
+//! into log-spaced bands from ~20 Hz to Nyquist. Precomputed linear bins from
+//! the playback vis tap skip that FFT and are only folded into the same bands.
+//! Bars only rise on **fresh** energy; silence, pause, or a stale tap lets
+//! cava-style gravity pull them down instead of inventing a synth fallback.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -136,6 +137,8 @@ pub struct Spectrum {
     n_bars: usize,
     /// True once real PCM has been pushed.
     has_pcm: bool,
+    /// True when [`Self::mags`] was filled by [`Self::feed_mags`] (skip FFT).
+    mags_direct: bool,
     last_pcm: Option<Instant>,
 }
 
@@ -164,6 +167,7 @@ impl Spectrum {
             vel: vec![0.0; n_bars],
             n_bars,
             has_pcm: false,
+            mags_direct: false,
             last_pcm: None,
         }
     }
@@ -185,6 +189,7 @@ impl Spectrum {
     /// Reset analyser state when the playing track changes.
     pub fn set_seed(&mut self, _seed: u64) {
         self.has_pcm = false;
+        self.mags_direct = false;
         self.last_pcm = None;
         self.pcm_len = 0;
         self.pcm.fill(0.0);
@@ -205,6 +210,7 @@ impl Spectrum {
             return;
         }
         self.has_pcm = true;
+        self.mags_direct = false;
         self.last_pcm = Some(Instant::now());
         if samples.len() >= FFT_SIZE {
             self.pcm
@@ -226,6 +232,22 @@ impl Spectrum {
         self.pcm_len = FFT_SIZE;
     }
 
+    /// Push linear frequency-bin levels already in `0..=1` (from the playback
+    /// vis tap). Skips the FFT so bars stay on the same clock as the speakers.
+    pub fn feed_mags(&mut self, mags: &[f32]) {
+        if mags.is_empty() {
+            return;
+        }
+        if self.mags.len() != mags.len() {
+            self.mags.resize(mags.len(), 0.0);
+        }
+        self.mags.copy_from_slice(mags);
+        self.has_pcm = true;
+        self.mags_direct = true;
+        self.last_pcm = Some(Instant::now());
+        self.pcm_len = FFT_SIZE;
+    }
+
     /// Advance by `dt` seconds. Bars only pick up energy from a fresh PCM
     /// window with audible RMS; otherwise gravity falls to zero.
     pub fn tick(
@@ -237,15 +259,23 @@ impl Spectrum {
         _position: f64,
     ) -> SpectrumFrame {
         let pcm_fresh = self.has_pcm && self.last_pcm.is_some_and(|t| t.elapsed() < PCM_STALE);
-        let audible = playing && volume > 0.01 && pcm_fresh && self.pcm_rms() >= SILENCE_RMS;
+        let energy = if self.mags_direct {
+            self.mags.iter().copied().fold(0.0f32, f32::max) > 0.04
+        } else {
+            self.pcm_rms() >= SILENCE_RMS
+        };
+        let audible = playing && volume > 0.01 && pcm_fresh && energy;
         if audible {
-            self.transform();
+            if !self.mags_direct {
+                self.transform();
+            }
             self.fold_bands();
         } else {
             self.levels.fill(0.0);
             if !pcm_fresh {
                 self.pcm.fill(0.0);
                 self.pcm_len = 0;
+                self.mags_direct = false;
             }
         }
         self.apply_gravity(dt, audible);
@@ -487,6 +517,36 @@ mod tests {
         assert!(
             after < before,
             "volume 0 should drop bars ({after} vs {before})"
+        );
+    }
+
+    #[test]
+    fn feed_mags_440_peaks_near_a4() {
+        let mut spec = Spectrum::new(32);
+        let n = 512;
+        let mut mags = vec![0.0f32; n];
+        // 440 Hz at 44.1 kHz Nyquist mapping: 440 / 22050 * 512 ≈ 10.2
+        let bin = (440.0 / 22_050.0 * n as f32).round() as usize;
+        mags[bin] = 1.0;
+        mags[bin.saturating_sub(1)] = 0.45;
+        mags[(bin + 1).min(n - 1)] = 0.45;
+        spec.feed_mags(&mags);
+        let frame = spec.tick(1.0 / 120.0, true, 1.0, 120.0, 1.0);
+        let (idx, _) = frame
+            .bars
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        assert!(
+            (4..24).contains(&idx),
+            "440 Hz mag peak at unexpected band {idx}: {:?}",
+            frame.bars
+        );
+        assert!(
+            frame.bars[idx] > 0.15,
+            "peak too quiet: {}",
+            frame.bars[idx]
         );
     }
 }

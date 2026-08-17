@@ -411,9 +411,14 @@ impl Engine {
 
         let playing = self.player.status() == PlayerStatus::Playing;
         let frame = if self.settings.show_spectrum {
-            let pcm = self.player.drain_pcm();
-            if !pcm.is_empty() {
-                self.spectrum.feed(&pcm);
+            let bins = self.player.drain_fft_bins();
+            if !bins.is_empty() {
+                self.spectrum.feed_mags(&bins);
+            } else {
+                let pcm = self.player.drain_pcm();
+                if !pcm.is_empty() {
+                    self.spectrum.feed(&pcm);
+                }
             }
             let vol = self.player.volume() as f32 / 100.0;
             let bpm = self

@@ -5,15 +5,16 @@
 //! and we can query decoder properties (sample rate, format, codec) live.
 //!
 //! A background observer thread holds a **persistent** IPC connection and
-//! `observe_property`s — the UI thread never blocks on sockets. A second idle
-//! `mpv` with `--ao=pcm` taps decoded samples into a FIFO for the rustfft
-//! analyser without touching the speakers or media keys.
+//! `observe_property`s — the UI thread never blocks on sockets. The spectrum
+//! tap lives in **this** process: lavfi `asplit` sends one copy to the speakers
+//! and a `showfreqs` copy to `--vo=image`, so bars follow the audible clock
+//! instead of a second untimed `--ao=pcm` decoder.
 //!
 //! On macOS we **disable** `--input-media-keys` so mpv does not steal Control
 //! Center / Now Playing from Tiders (souvlaki). A cocoa activation policy on
 //! mpv would register a second Now Playing identity named "mpv".
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -47,14 +48,8 @@ struct Live {
     bitrate: AtomicU32,
     codec: Mutex<Option<String>>,
     format: Mutex<Option<String>>,
-    /// Decoded PCM from the visualiser tap (mono f32, ~44.1 kHz).
-    pcm: Mutex<Vec<f32>>,
-    /// Playback position (seconds) that corresponds to `emitted == 0` in the
-    /// PCM reader. Seek / play bump [`Self::vis_epoch`] so the reader resets.
-    vis_origin: AtomicU64,
-    vis_epoch: AtomicU64,
-    /// Requested vis sidecar seek (f64 bits). `NAN` means none.
-    vis_seek: AtomicU64,
+    /// Linear `showfreqs` bin levels (`0..=1`) from the same-process tap.
+    bins: Arc<Mutex<Vec<f32>>>,
 }
 
 impl Live {
@@ -86,31 +81,26 @@ impl Live {
         (v > 0.0).then_some(v)
     }
 
-    fn reset_vis_clock(&self, origin: f64) {
-        self.vis_origin.store(origin.to_bits(), Ordering::Relaxed);
-        self.vis_epoch.fetch_add(1, Ordering::SeqCst);
-        self.vis_seek.store(f64::NAN.to_bits(), Ordering::Relaxed);
+    fn clear_bins(&self) {
+        if let Ok(mut bins) = self.bins.lock() {
+            bins.clear();
+        }
     }
 }
 
 /// Playback backend that drives a persistent `mpv` subprocess.
 pub struct MpvBackend {
     child: Option<Child>,
-    vis: Option<Child>,
     ipc_path: PathBuf,
-    vis_ipc: PathBuf,
-    fifo_path: PathBuf,
+    vis_dir: PathBuf,
     volume: u8,
     replaygain: String,
     reported_finished: bool,
     started_file: bool,
     live: Arc<Live>,
-    /// Bumped on every respawn so observer / PCM threads exit.
+    /// Bumped on every respawn so observer / vis threads exit.
     gen: Arc<AtomicU64>,
-    /// Separate from `gen` so a dead vis sidecar can restart without killing
-    /// the main mpv observer.
     vis_gen: Arc<AtomicU64>,
-    current_url: Option<String>,
 }
 
 impl MpvBackend {
@@ -133,22 +123,15 @@ impl MpvBackend {
         }
         Ok(Self {
             child: None,
-            vis: None,
             ipc_path: unique_path("mpv", "sock"),
-            vis_ipc: unique_path("vis", "sock"),
-            fifo_path: unique_path("pcm", "fifo"),
+            vis_dir: unique_path("vis", "d"),
             volume: volume.min(100),
             replaygain: replaygain.to_string(),
             reported_finished: false,
             started_file: false,
-            live: {
-                let live = Arc::new(Live::default());
-                live.vis_seek.store(f64::NAN.to_bits(), Ordering::Relaxed);
-                live
-            },
+            live: Arc::new(Live::default()),
             gen: Arc::new(AtomicU64::new(0)),
             vis_gen: Arc::new(AtomicU64::new(0)),
-            current_url: None,
         })
     }
 
@@ -171,7 +154,6 @@ impl MpvBackend {
 
         let mut command = Command::new("mpv");
         command
-            .arg("--no-video")
             .arg("--no-terminal")
             .arg("--really-quiet")
             .arg("--idle=yes")
@@ -183,21 +165,37 @@ impl MpvBackend {
             .arg("--input-media-keys=no")
             .arg("--force-window=no")
             .arg("--audio-display=no")
+            .arg("--hwdec=no")
+            .arg("--osc=no")
+            .arg("--osd-level=0")
             .arg(format!("--volume={}", self.volume))
             .arg(format!("--replaygain={}", self.replaygain))
             .arg("--replaygain-clip=yes")
             .arg("--demuxer-lavf-o=protocol_whitelist=[file,crypto,data,https,tls,tcp,http]")
             .arg(format!("--input-ipc-server={}", self.ipc_path.display()));
 
-        if let Some(ao) = std::env::var_os("TIDERS_MPV_AO") {
-            command.arg(format!("--ao={}", ao.to_string_lossy()));
+        if vis_enabled() {
+            let _ = std::fs::create_dir_all(&self.vis_dir);
+            command
+                .arg("--video-sync=audio")
+                .arg("--framedrop=vo")
+                .arg("--vo=image")
+                .arg("--vo-image-format=png")
+                .arg("--vo-image-png-compression=0")
+                .arg(format!("--vo-image-outdir={}", self.vis_dir.display()))
+                .arg(format!("--lavfi-complex={}", super::vis::lavfi_complex()));
+        } else {
+            command.arg("--no-video");
+            #[cfg(target_os = "macos")]
+            {
+                // Headless audio only. Do **not** set macos-app-activation-policy —
+                // that creates an NSApplication named "mpv" and hijacks Now Playing.
+                command.arg("--vo=null");
+            }
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            // Headless audio only. Do **not** set macos-app-activation-policy —
-            // that creates an NSApplication named "mpv" and hijacks Now Playing.
-            command.arg("--vo=null");
+        if let Some(ao) = std::env::var_os("TIDERS_MPV_AO") {
+            command.arg(format!("--ao={}", ao.to_string_lossy()));
         }
 
         let child = command
@@ -223,108 +221,16 @@ impl MpvBackend {
             Arc::clone(&self.gen),
             gen,
         );
-        self.spawn_vis();
-        Ok(())
-    }
-
-    fn vis_alive(&mut self) -> bool {
-        match self.vis.as_mut() {
-            Some(child) => child.try_wait().ok().flatten().is_none(),
-            None => false,
-        }
-    }
-
-    fn ensure_vis(&mut self) {
-        if pcm_vis_enabled() && !self.vis_alive() {
-            self.spawn_vis();
-        }
-    }
-
-    fn spawn_vis(&mut self) {
-        // Second silent mpv dumps decoded PCM into a FIFO for the analyser.
-        // Disable with TIDERS_PCM_VIS=0 if the extra process is too heavy.
-        if !pcm_vis_enabled() {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            if let Some(mut old) = self.vis.take() {
-                let _ = old.kill();
-                let _ = old.wait();
-            }
-            let _ = std::fs::remove_file(&self.vis_ipc);
-            let _ = std::fs::remove_file(&self.fifo_path);
-            self.vis_ipc = unique_path("vis", "sock");
-            self.fifo_path = unique_path("pcm", "fifo");
-            if mkfifo(&self.fifo_path).is_err() {
-                return;
-            }
-
-            let mut command = Command::new("mpv");
-            command
-                .arg("--no-video")
-                .arg("--no-terminal")
-                .arg("--really-quiet")
-                .arg("--idle=yes")
-                .arg("--force-window=no")
-                .arg("--input-media-keys=no")
-                // `--ao=pcm` is an untimed AO: `--untimed=no` does not throttle
-                // it. The FIFO reader paces to 44.1 kHz so this sidecar cannot
-                // dump a whole track in ~20s (then go silent while audio plays).
-                .arg("--untimed=no")
-                .arg("--cache=yes")
-                .arg("--demuxer-readahead-secs=15")
-                .arg("--network-timeout=60")
-                .arg("--audio-display=no")
-                .arg("--audio-format=s16")
-                .arg("--audio-samplerate=44100")
-                .arg("--audio-channels=mono")
-                .arg("--ao=pcm")
-                .arg("--ao-pcm-waveheader=no")
-                .arg(format!("--ao-pcm-file={}", self.fifo_path.display()))
-                .arg(format!("--input-ipc-server={}", self.vis_ipc.display()));
-
-            match command
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(child) => self.vis = Some(child),
-                Err(_) => {
-                    let _ = std::fs::remove_file(&self.fifo_path);
-                    return;
-                }
-            }
-
-            let deadline = Instant::now() + Duration::from_millis(1500);
-            while Instant::now() < deadline {
-                if self.vis_ipc.exists() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-
+        if vis_enabled() {
             let mine = self.vis_gen.fetch_add(1, Ordering::SeqCst) + 1;
-            spawn_pcm_reader(
-                self.fifo_path.clone(),
-                Arc::clone(&self.live),
+            super::vis::spawn_frame_reader(
+                self.vis_dir.clone(),
+                Arc::clone(&self.live.bins),
                 Arc::clone(&self.vis_gen),
                 mine,
             );
         }
-    }
-
-    fn vis_cmd(&self, command: &serde_json::Value) {
-        if self.vis.is_none() {
-            return;
-        }
-        for _ in 0..8 {
-            if send_ipc(&self.vis_ipc, command, None).is_ok() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        Ok(())
     }
 
     fn send_command(&self, command: &serde_json::Value) -> Result<()> {
@@ -332,22 +238,11 @@ impl MpvBackend {
     }
 
     fn stop_helpers(&mut self) {
-        if let Some(mut vis) = self.vis.take() {
-            let _ = send_ipc(&self.vis_ipc, &serde_json::json!(["quit"]), None);
-            let _ = vis.kill();
-            let _ = vis.wait();
-        }
-        // Unblock a reader stuck on `open(fifo)` by briefly opening it for write.
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&self.fifo_path);
-        let _ = std::fs::remove_file(&self.vis_ipc);
-        let _ = std::fs::remove_file(&self.fifo_path);
         self.gen.fetch_add(1, Ordering::SeqCst);
         self.vis_gen.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut pcm) = self.live.pcm.lock() {
-            pcm.clear();
-        }
+        self.live.clear_bins();
+        super::vis::clear_frames(&self.vis_dir);
+        let _ = std::fs::remove_dir_all(&self.vis_dir);
     }
 
     fn kill_child(&mut self) {
@@ -366,7 +261,6 @@ impl MpvBackend {
 impl AudioBackend for MpvBackend {
     fn play(&mut self, url: &str) -> Result<()> {
         self.ensure_alive()?;
-        self.ensure_vis();
         self.reported_finished = false;
         self.started_file = true;
         self.live.eof.store(false, Ordering::Relaxed);
@@ -377,15 +271,10 @@ impl AudioBackend for MpvBackend {
             .time_pos
             .store(0.0f64.to_bits(), Ordering::Relaxed);
         self.live.pos_millis.store(0, Ordering::Relaxed);
-        self.live.reset_vis_clock(0.0);
-        self.current_url = Some(url.to_string());
-        if let Ok(mut pcm) = self.live.pcm.lock() {
-            pcm.clear();
-        }
+        self.live.clear_bins();
+        super::vis::clear_frames(&self.vis_dir);
         let _ = self.send_command(&serde_json::json!(["set_property", "volume", self.volume]));
         self.send_command(&serde_json::json!(["loadfile", url, "replace"]))?;
-        self.vis_cmd(&serde_json::json!(["set_property", "pause", false]));
-        self.vis_cmd(&serde_json::json!(["loadfile", url, "replace"]));
         Ok(())
     }
 
@@ -395,7 +284,6 @@ impl AudioBackend for MpvBackend {
             self.live.paused.store(true, Ordering::Relaxed);
             self.live.time_pos.store(pos.to_bits(), Ordering::Relaxed);
             let _ = self.send_command(&serde_json::json!(["set_property", "pause", true]));
-            self.vis_cmd(&serde_json::json!(["set_property", "pause", true]));
         }
         Ok(())
     }
@@ -405,7 +293,6 @@ impl AudioBackend for MpvBackend {
             self.live.paused.store(false, Ordering::Relaxed);
             self.live.pos_millis.store(unix_millis(), Ordering::Relaxed);
             let _ = self.send_command(&serde_json::json!(["set_property", "pause", false]));
-            self.vis_cmd(&serde_json::json!(["set_property", "pause", false]));
         }
         Ok(())
     }
@@ -413,7 +300,6 @@ impl AudioBackend for MpvBackend {
     fn stop(&mut self) -> Result<()> {
         if self.child.is_some() {
             let _ = self.send_command(&serde_json::json!(["stop"]));
-            self.vis_cmd(&serde_json::json!(["stop"]));
         }
         self.started_file = false;
         self.reported_finished = false;
@@ -459,12 +345,9 @@ impl AudioBackend for MpvBackend {
     fn seek(&mut self, seconds: f64) -> Result<()> {
         if self.child.is_some() {
             let _ = self.send_command(&serde_json::json!(["seek", seconds, "absolute"]));
-            self.vis_cmd(&serde_json::json!(["seek", seconds, "absolute"]));
             self.live.stamp_pos(seconds.max(0.0));
-            self.live.reset_vis_clock(seconds.max(0.0));
-            if let Ok(mut pcm) = self.live.pcm.lock() {
-                pcm.clear();
-            }
+            self.live.clear_bins();
+            super::vis::clear_frames(&self.vis_dir);
         }
         Ok(())
     }
@@ -523,33 +406,19 @@ impl AudioBackend for MpvBackend {
         if self.child.is_some() {
             let val = if on { "inf" } else { "no" };
             let _ = self.send_command(&serde_json::json!(["set_property", "loop-file", val]));
-            self.vis_cmd(&serde_json::json!(["set_property", "loop-file", val]));
         }
         Ok(())
     }
 
     fn drain_pcm(&mut self, dst: &mut Vec<f32>) {
-        let seek = f64::from_bits(
-            self.live
-                .vis_seek
-                .swap(f64::NAN.to_bits(), Ordering::Relaxed),
-        );
-        if seek.is_finite() {
-            if let Some(url) = &self.current_url {
-                self.vis_cmd(&serde_json::json!([
-                    "loadfile",
-                    url,
-                    "replace",
-                    0,
-                    format!("start={seek}")
-                ]));
-                self.live.reset_vis_clock(seek.max(0.0));
-            }
-        }
         dst.clear();
-        if let Ok(mut pcm) = self.live.pcm.lock() {
-            dst.extend_from_slice(&pcm);
-            pcm.clear();
+    }
+
+    fn drain_fft_bins(&mut self, dst: &mut Vec<f32>) {
+        dst.clear();
+        if let Ok(mut bins) = self.live.bins.lock() {
+            dst.extend_from_slice(&bins);
+            bins.clear();
         }
     }
 }
@@ -581,27 +450,13 @@ fn unique_path(kind: &str, ext: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tiders-{kind}-{pid}-{n}.{ext}"))
 }
 
-fn pcm_vis_enabled() -> bool {
+fn vis_enabled() -> bool {
     match std::env::var("TIDERS_PCM_VIS") {
         Ok(v) => !matches!(
             v.to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
         ),
         Err(_) => true,
-    }
-}
-
-#[cfg(unix)]
-fn mkfifo(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "fifo path contains NUL")
-    })?;
-    let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -770,118 +625,6 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn spawn_pcm_reader(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
-    std::thread::Builder::new()
-        .name("tiders-pcm".into())
-        .spawn(move || pcm_loop(fifo, live, gen, mine))
-        .ok();
-}
-
-/// How long the FIFO reader should wait so PCM stays locked to the **main**
-/// player's clock (not wall-time from when the sidecar happened to start).
-fn pcm_throttle_to_clock(vis_pos: f64, main_pos: f64) -> Duration {
-    let ahead = vis_pos - main_pos;
-    if ahead <= 0.002 {
-        Duration::ZERO
-    } else {
-        Duration::from_secs_f64(ahead.min(0.08))
-    }
-}
-
-/// Legacy helper kept for tests that describe the old wall-clock pacer.
-#[cfg(test)]
-fn pcm_throttle(emitted: u64, origin: Instant, sample_rate: f64) -> Duration {
-    if emitted == 0 || sample_rate <= 0.0 {
-        return Duration::ZERO;
-    }
-    let ahead = emitted as f64 / sample_rate - origin.elapsed().as_secs_f64();
-    if ahead <= 0.002 {
-        Duration::ZERO
-    } else {
-        Duration::from_secs_f64(ahead.min(0.08))
-    }
-}
-
-fn pcm_loop(fifo: PathBuf, live: Arc<Live>, gen: Arc<AtomicU64>, mine: u64) {
-    let mut raw = vec![0u8; 2048];
-    while gen.load(Ordering::Relaxed) == mine {
-        let file = loop {
-            if gen.load(Ordering::Relaxed) != mine {
-                return;
-            }
-            match std::fs::File::open(&fifo) {
-                Ok(f) => break f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                Err(_) => std::thread::sleep(Duration::from_millis(40)),
-            }
-        };
-        let mut reader = std::io::BufReader::new(file);
-        let mut epoch = live.vis_epoch.load(Ordering::Relaxed);
-        let mut origin = f64::from_bits(live.vis_origin.load(Ordering::Relaxed));
-        let mut emitted = 0u64;
-        while gen.load(Ordering::Relaxed) == mine {
-            match reader.read(&mut raw) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let now_epoch = live.vis_epoch.load(Ordering::Relaxed);
-                    if now_epoch != epoch {
-                        epoch = now_epoch;
-                        origin = f64::from_bits(live.vis_origin.load(Ordering::Relaxed));
-                        emitted = 0;
-                    }
-                    let mut decoded = Vec::with_capacity(n / 2);
-                    for chunk in raw[..n].chunks_exact(2) {
-                        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-                        decoded.push(s as f32 / 32768.0);
-                    }
-                    if decoded.is_empty() {
-                        continue;
-                    }
-                    let main_pos = live.time_pos().unwrap_or(0.0);
-                    let vis_pos = origin + emitted as f64 / 44_100.0;
-                    let lag = main_pos - vis_pos;
-                    if lag > 1.0 {
-                        live.vis_seek.store(main_pos.to_bits(), Ordering::Relaxed);
-                        if let Ok(mut pcm) = live.pcm.lock() {
-                            pcm.clear();
-                        }
-                        continue;
-                    }
-                    if lag > 0.25 {
-                        let skip = ((lag - 0.05) * 44_100.0) as usize;
-                        let skip = skip.min(decoded.len());
-                        if skip > 0 {
-                            decoded.drain(..skip);
-                            emitted = emitted.saturating_add(skip as u64);
-                        }
-                        if decoded.is_empty() {
-                            continue;
-                        }
-                    }
-                    if let Ok(mut pcm) = live.pcm.lock() {
-                        pcm.extend_from_slice(&decoded);
-                        let max = 8192;
-                        if pcm.len() > max {
-                            let skip = pcm.len() - max;
-                            pcm.drain(..skip);
-                        }
-                    }
-                    emitted = emitted.saturating_add(decoded.len() as u64);
-                    let vis_pos = origin + emitted as f64 / 44_100.0;
-                    let delay = pcm_throttle_to_clock(vis_pos, live.time_pos().unwrap_or(vis_pos));
-                    if !delay.is_zero() {
-                        let until = Instant::now() + delay;
-                        while Instant::now() < until && gen.load(Ordering::Relaxed) == mine {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-}
-
 #[cfg(unix)]
 fn send_ipc(
     path: &Path,
@@ -948,61 +691,4 @@ fn send_ipc(
     _wait: Option<Duration>,
 ) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Null)
-}
-
-#[cfg(test)]
-mod pace_tests {
-    use super::{pcm_throttle, pcm_throttle_to_clock};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn pcm_throttle_is_zero_before_samples() {
-        assert_eq!(pcm_throttle(0, Instant::now(), 44_100.0), Duration::ZERO);
-    }
-
-    #[test]
-    fn pcm_throttle_paces_a_second_of_audio() {
-        let origin = Instant::now();
-        let d = pcm_throttle(44_100, origin, 44_100.0);
-        assert!(
-            d >= Duration::from_millis(50),
-            "expected a real-time wait, got {d:?}"
-        );
-        assert!(d <= Duration::from_millis(80));
-    }
-
-    #[test]
-    fn vis_waits_when_ahead_of_the_player_clock() {
-        let d = pcm_throttle_to_clock(5.0, 4.5);
-        assert!(d >= Duration::from_millis(50));
-        assert!(d <= Duration::from_millis(80));
-    }
-
-    #[test]
-    fn vis_does_not_wait_when_behind_the_player_clock() {
-        assert_eq!(pcm_throttle_to_clock(1.0, 1.4), Duration::ZERO);
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::mkfifo;
-    use std::os::unix::fs::FileTypeExt;
-
-    #[test]
-    fn mkfifo_creates_a_named_pipe() {
-        let path = std::env::temp_dir().join(format!(
-            "tiders-mkfifo-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_file(&path);
-        mkfifo(&path).expect("libc mkfifo");
-        let meta = std::fs::metadata(&path).expect("stat fifo");
-        assert!(meta.file_type().is_fifo());
-        let _ = std::fs::remove_file(&path);
-    }
 }
