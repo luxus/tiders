@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/luxus/tiders/releases/tag/v0.1.0) - 2026-08-17
+
+### Added
+
+- *(tui)* Mixes tab, mouse, toast/scrub fixes, slower redraw
+- *(tui)* inline album art, popups (help/detail/quality), progress bar, marquee, gradient spectrum, toasts, animations
+- *(app)* tiders CLI + ratatui TUI, mpv playback, Cloud Agent environment, docs
+- *(core)* tiders-core library — config, session/auth (tidlers), player engine, queue
+
+### Fixed
+
+- *(player)* keep the spectrum on the same clock as the speakers ([#10](https://github.com/luxus/tiders/pull/10))
+- spectrum, context menu, full library, and toast position ([#7](https://github.com/luxus/tiders/pull/7))
+- *(tui)* address review notes on favorites, artist errors, and filter hits
+- *(tui)* decay spectrum, pad cover art, and official-app layout
+- *(tui)* write Now Playing covers with create_new
+- *(tui)* map the last scrubber cell to the end of the track
+- *(tui)* drop lazy or_else when the fallback is None
+
+### Other
+
+- Engine IPC daemon, Hi-Res DASH assembly, and playlist download ([#8](https://github.com/luxus/tiders/pull/8))
+- Player features: mixes, OS media, FFT spectrum, now-playing, 120Hz ([#3](https://github.com/luxus/tiders/pull/3))
+
 ### Added
 
 - Background `tiders daemon` with a versioned Unix JSON IPC socket so GUI
