@@ -1,9 +1,10 @@
 //! Real FFT spectrum analyser (cava-style gravity + peak hold).
 //!
-//! Incoming PCM **or** precomputed linear bins (from the playback vis tap) are
-//! windowed / folded into log-spaced bands from ~20 Hz to Nyquist. Bars only
-//! rise on **fresh** energy; silence, pause, or a stale tap lets cava-style
-//! gravity pull them down instead of inventing a synth fallback.
+//! Incoming PCM is Hann-windowed and transformed with [`rustfft`], then folded
+//! into log-spaced bands from ~20 Hz to Nyquist. Precomputed linear bins from
+//! the playback vis tap skip that FFT and are only folded into the same bands.
+//! Bars only rise on **fresh** energy; silence, pause, or a stale tap lets
+//! cava-style gravity pull them down instead of inventing a synth fallback.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};

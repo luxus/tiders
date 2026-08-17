@@ -96,27 +96,44 @@ pub fn spawn_frame_reader(
 }
 
 fn frame_loop(dir: PathBuf, bins: Arc<Mutex<Vec<f32>>>, gen: Arc<AtomicU64>, mine: u64) {
+    let mut last: Option<PathBuf> = None;
     while gen.load(Ordering::Relaxed) == mine {
-        if let Some((keep, rgb, w, h)) = latest_rgb_frame(&dir) {
+        if let Some((path, rgb, w, h)) = next_rgb_frame(&dir, last.as_deref()) {
             let levels = column_levels(&rgb, w as usize, h as usize);
             if !levels.is_empty() {
                 if let Ok(mut guard) = bins.lock() {
                     *guard = levels;
                 }
             }
-            sweep_pngs(&dir, &keep);
+            sweep_older_pngs(&dir, &path);
+            last = Some(path);
         }
-        std::thread::sleep(Duration::from_millis(8));
+        // showfreqs is rate=30; skip re-reading the same frame between ticks.
+        std::thread::sleep(Duration::from_millis(16));
     }
 }
 
-/// Newest PNG that decodes. The file mpv is still writing usually fails.
-fn latest_rgb_frame(dir: &Path) -> Option<(PathBuf, Vec<u8>, u32, u32)> {
+fn is_png(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "png")
+}
+
+fn file_name_newer(path: &Path, after: Option<&Path>) -> bool {
+    match (path.file_name(), after.and_then(|p| p.file_name())) {
+        (Some(a), Some(b)) => a > b,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Newest PNG newer than `after` that fully decodes.
+///
+/// Incomplete files mpv is still writing fail decode and are left on disk.
+fn next_rgb_frame(dir: &Path, after: Option<&Path>) -> Option<(PathBuf, Vec<u8>, u32, u32)> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "png"))
+        .filter(|p| is_png(p) && file_name_newer(p, after))
         .collect();
     files.sort();
     for path in files.into_iter().rev() {
@@ -132,13 +149,18 @@ fn latest_rgb_frame(dir: &Path) -> Option<(PathBuf, Vec<u8>, u32, u32)> {
     None
 }
 
-fn sweep_pngs(dir: &Path, keep: &Path) {
+/// Remove frames older than `keep`. Newer names are left alone so a PNG that
+/// is still being written is not deleted before it becomes readable.
+fn sweep_older_pngs(dir: &Path, keep: &Path) {
+    let Some(keep_name) = keep.file_name() else {
+        return;
+    };
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p != *keep && p.extension().is_some_and(|ext| ext == "png") {
+        if is_png(&p) && p.file_name().is_some_and(|n| n < keep_name) {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -151,7 +173,7 @@ pub fn clear_frames(dir: &Path) {
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.extension().is_some_and(|ext| ext == "png") {
+        if is_png(&p) {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -227,6 +249,50 @@ mod tests {
         assert!(lavfi_complex().contains("showfreqs="));
         assert!(lavfi_complex().contains("format=rgb24[vo]"));
         assert!(!lavfi_complex().contains("averaging=0"));
+    }
+
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tiders-vis-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    #[test]
+    fn sweep_keeps_current_and_newer_frames() {
+        let dir = scratch_dir();
+        let a = dir.join("00000001.png");
+        let b = dir.join("00000002.png");
+        let c = dir.join("00000003.png");
+        std::fs::write(&a, b"old").unwrap();
+        std::fs::write(&b, b"cur").unwrap();
+        std::fs::write(&c, b"new-incomplete").unwrap();
+        sweep_older_pngs(&dir, &b);
+        assert!(!a.exists(), "older frame should be removed");
+        assert!(b.exists(), "decoded frame should stay");
+        assert!(c.exists(), "in-progress newer frame must not be deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_frame_skips_already_seen_names() {
+        let dir = scratch_dir();
+        let seen = dir.join("00000002.png");
+        let newer = dir.join("00000003.png");
+        std::fs::write(dir.join("00000001.png"), b"x").unwrap();
+        std::fs::write(&seen, b"x").unwrap();
+        std::fs::write(&newer, b"not-a-png").unwrap();
+        assert!(
+            next_rgb_frame(&dir, Some(&seen)).is_none(),
+            "incomplete newer file should not rewind to an older frame"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
